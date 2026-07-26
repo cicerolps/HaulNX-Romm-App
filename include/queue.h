@@ -36,6 +36,10 @@ typedef struct {
     char url[1024];
     char name[512];
     char target[64]; /* console folder under tico/roms */
+    char dest[600];  /* resolved absolute install directory. Empty = the default
+                        <roms_root>/<target>; set when the console has a custom
+                        install folder. Snapshotted at enqueue so a later config
+                        change doesn't redirect an item already in flight. */
     char auth[320];  /* optional archive.org S3 auth header */
     char md5[33];    /* expected MD5 hex from metadata, "" if unknown */
     uint64_t size;   /* expected file size from metadata (0 if unknown) */
@@ -48,6 +52,11 @@ typedef struct {
     volatile int ex_files;     /* files extracted so far, while extracting */
     volatile bool cancel;
     volatile bool pause; /* ask the worker to preempt this download (keep .part) */
+    /* Non-zero asks the owning worker to hand a stuck/in-progress item back to
+     * the queue instead of cancelling it: 1 = retry (keep the .part and re-run
+     * verify/extract), 2 = redownload (drop the .part and pull it again). Paired
+     * with `cancel` for actively-owned items; see queue_requeue. Transient. */
+    volatile int requeue;
     /* Passed over this round because the card can't hold what's left of it.
      * In-memory only (never persisted): a smaller item behind it still runs,
      * and the flag is cleared whenever free space could have changed. */
@@ -85,10 +94,12 @@ void queue_set_max_dl(int n);
 void queue_set_rate_limits(int all_bps, int item_bps);
 
 /* Enqueue a download. Returns false if the queue is full. md5 may be "" or NULL
- * when no checksum is known. */
+ * when no checksum is known. dest may be "" or NULL to install into the default
+ * <roms_root>/<target>; pass a resolved absolute directory to install a console
+ * with a custom folder elsewhere. */
 bool queue_add(const char *url, const char *name, const char *target,
                const char *auth, uint64_t size, bool is_archive,
-               const char *md5);
+               const char *md5, const char *dest);
 
 /* How many more items queue_add can accept right now. Lets a bulk add tell the
  * user "only 40 of your 500 fit" before it queues anything, instead of stopping
@@ -127,6 +138,15 @@ void queue_cancel(int slot);
 /* Re-queue a failed/cancelled item (by slot) to run again in its current list
  * position, resuming from any .part already on disk. No-op for other states. */
 void queue_retry(int slot);
+
+/* Hand an in-progress item (downloading / verifying / awaiting-extract /
+ * extracting) back to the queue so it runs again from its current list
+ * position — the escape hatch for an item that appears stuck in verify or
+ * unzip. wipe=false keeps the downloaded .part and re-runs verify/extract
+ * (Retry); wipe=true drops the .part and pulls the file again (Redownload).
+ * Also works on queued/paused/failed/cancelled items. The owning worker
+ * releases the item cooperatively, so the change may land a moment later. */
+void queue_requeue(int slot, bool wipe);
 
 /* Re-queue every FAILED item at once (resuming from any .part on disk).
  * Returns how many were re-queued. */

@@ -974,6 +974,20 @@ class CardGrid : public pu::ui::elm::Element {
                     }
                     continue;
                 }
+                Cell &ce = this->cache[idx];
+                // Cards with no info line (the settings sections) would leave
+                // the icon+title hugging the top, with the empty subtitle band
+                // as dead space below. Centre the icon+title block vertically
+                // in that case; cards that carry a subtitle keep the fixed
+                // 3-band layout (Browse/Installed counts, the Updates chip).
+                s32 voff = 0;
+                if (!ce.sub_tex) {
+                    s32 block_bot = ce.t2_tex ? 178 + ce.t2h : 158 + ce.t1h;
+                    voff = (CardH - (block_bot - 10)) / 2 - 10;
+                    if (voff < 0) {
+                        voff = 0;
+                    }
+                }
                 if (cd.icon) {
                     // The selected card's icon grows slightly with the fade.
                     s32 isz = IconPx;
@@ -983,7 +997,7 @@ class CardGrid : public pu::ui::elm::Element {
                         // same fade. Largest ring (r=67) stays inside the card
                         // and clear of the title band at cy + 144.
                         s32 gcx = cx + cw / 2;
-                        s32 gcy = cy + 10 + IconPx / 2;
+                        s32 gcy = cy + 10 + IconPx / 2 + voff;
                         for (s32 g = 0; g < 4; g++) {
                             auto gc = this->glow_clr;
                             gc.a = (u8)((14 + 5 * g) * this->sel_alpha / 255);
@@ -1005,19 +1019,18 @@ class CardGrid : public pu::ui::elm::Element {
                     // enlarged icon never touches a two-line title below it.
                     drawer->RenderTexture(this->cards[idx].icon,
                                           cx + (cw - isz) / 2,
-                                          cy + 10 - (isz - IconPx), o);
+                                          cy + 10 - (isz - IconPx) + voff, o);
                 }
-                Cell &ce = this->cache[idx];
                 // One-line titles centre in the two-line band; the small info
                 // line sits at a fixed baseline below.
                 if (ce.t1_tex) {
-                    s32 ty = ce.t2_tex ? cy + 144 : cy + 158;
+                    s32 ty = (ce.t2_tex ? cy + 144 : cy + 158) + voff;
                     drawer->RenderTexture(ce.t1_tex, cx + (cw - ce.t1w) / 2,
                                           ty);
                 }
                 if (ce.t2_tex) {
                     drawer->RenderTexture(ce.t2_tex, cx + (cw - ce.t2w) / 2,
-                                          cy + 178);
+                                          cy + 178 + voff);
                 }
                 if (ce.sub_tex) {
                     s32 sx = cx + (cw - ce.sw) / 2;

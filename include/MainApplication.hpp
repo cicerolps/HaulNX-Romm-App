@@ -10,6 +10,7 @@
 #include "TableList.hpp"
 #include "CardGrid.hpp"
 #include "httpsrv.h"
+#include "net.h"
 
 // Draws a BORROWED texture (an icon owned by a shared cache) at a fixed size
 // and position. Used for the console icon shown next to the header title.
@@ -581,14 +582,23 @@ class MainApplication : public pu::ui::Application {
         Log,
         Manage,   // show/hide consoles on the Browse page
         Creds,    // archive.org credentials editor
-        Advanced, // advanced settings sub-menu
-        UISettings, // user interface settings sub-menu (theme/cards/consoles/language)
+        DlPrefs,  // Downloads settings (concurrency/rate/skip/keep-awake)
+        Appearance, // Appearance settings (theme/cards/group/language)
         ExtFilter, // Browse file-view extension filter editor
         Downloads, // manage downloads folder
         Language,  // language selector
         Search,    // global file search across cached repos
         Cache,     // metadata cache management
-        ManageData, // settings submenu: downloads folder + metadata cache
+        Transfers, // settings submenu: import/export/restore/update over Wi-Fi
+        Sources,   // settings submenu: manage consoles/repos + file-type filter
+        Storage,   // settings submenu: SD space, ROM folder, temp + caches
+        InstallFolders, // Storage sub-screen: per-console custom install folders
+        Account,   // settings submenu: archive.org creds + startup net check
+        Updates,   // settings submenu: check now + auto-check toggle
+        Diagnostics, // settings submenu: logs, self-test, tuning, reset
+        About,     // settings submenu: getting started, release notes, credits
+        ExtTuning, // Diagnostics sub-screen: extraction perf knobs (dev)
+        SpeedTest, // Diagnostics sub-screen: live download/upload meters
         ViewLogs,  // settings submenu: download log + debug log
         DebugLog,  // debug.log viewer
         QueueState, // persisted queue-data (queue.json) viewer
@@ -614,6 +624,9 @@ class MainApplication : public pu::ui::Application {
     std::string pending_id;  // archive id for a Manual-URL download
     std::string inst_path;   // current dir in the installed browser
     std::string picker_path; // current dir in the ROM-folder picker
+    int picker_console = -1; // ROM-folder picker target: -1 = the ROM root, else
+                             // the console index whose custom install folder is
+                             // being chosen (returns to that console's screen)
     Screen log_origin;       // screen to return to from the log viewer
     // Which file the shared text-log viewer is showing, and its labels.
     std::string log_view_path;
@@ -699,6 +712,24 @@ class MainApplication : public pu::ui::Application {
     char bgchk_tag[64];
     char bgchk_url[1024];
 
+    // Background network self-test (Diagnostics -> Network self-test): checks
+    // the LAN address and reaches archive.org off the UI thread so a slow or
+    // dead connection can't freeze the app. The result only feeds a dialog.
+    BgTask diag;
+    std::atomic<bool> diag_lan{false}; // have a local IP (network is up)
+    std::atomic<bool> diag_net{false}; // archive.org responded 2xx
+    char diag_ip[46] = "";
+    // The diag BgTask is shared between the self-test and the speed test;
+    // diag_speed picks which live view + result DiagTick shows.
+    bool diag_speed = false;
+    bool diag_sp_ok = false;       // both phases finished cleanly
+    bool diag_sp_cancelled = false; // user backed out mid-test
+    double diag_mbps = 0.0;        // final download rate (Mbps)
+    double diag_ul_mbps = 0.0;     // final upload rate (Mbps)
+    // Live counters shared with the worker thread; the UI reads them each frame
+    // to draw the meters and sets sp_prog.cancel to abort. See net.h SpeedProg.
+    SpeedProg sp_prog{};
+
     // Background bulk metadata refresh (Manage data -> Refresh all metadata):
     // force-fetches every enabled repo's file list, with live (n/total)
     // progress and B to cancel between repos.
@@ -778,7 +809,8 @@ class MainApplication : public pu::ui::Application {
 
     void Toast(const std::string &msg);
     void ToastErr(const std::string &msg);
-    bool Confirm(const std::string &title, const std::string &msg);
+    bool Confirm(const std::string &title, const std::string &msg,
+                 bool yes_default = false);
     // Confirm for a destructive action: red-accented dialog, Cancel is the
     // default. If `permanent`, appends an "unrecoverable" warning line.
     bool ConfirmDanger(const std::string &title, const std::string &msg,
@@ -813,12 +845,32 @@ class MainApplication : public pu::ui::Application {
     void GotoLog();
     void GotoManage();
     void GotoCreds();
-    void GotoAdvanced();
+    void GotoDlPrefs();
     void GotoRomPicker(const std::string &path);
-    void GotoUISettings();
+    void GotoAppearance();
     void GotoExtFilter();
     void GotoDownloads();
     void GotoLanguage();
+    // New settings hierarchy: one screen per concern (see GotoSettings).
+    void GotoSources();
+    void GotoStorage();
+    void GotoInstallFolders();
+    void GotoAccount();
+    void GotoUpdates();
+    void GotoDiagnostics();
+    void GotoAbout();
+    void GotoExtTuning();
+    // Diagnostics / About actions.
+    void StorageDetail();   // A on the SD-card status row: used/free breakdown
+    void ExportBundle();    // concatenate the logs into one shareable file
+    void NetSelfTest();     // kick off the background LAN + archive.org check
+    void SpeedTest();       // kick off the background download+upload speed test
+    void SpeedRender();     // redraw the live download/upload meters each frame
+    void DiagTick();        // poll the self-test; show the result when done
+    static void DiagThread(void *arg);
+    static void SpeedThread(void *arg);
+    void ResetDefaults();   // restore every pref to its built-in default
+    void GettingStarted();  // re-runnable first-run onboarding prompt
     // Search cached metadata. scope_ci < 0 searches every repo; scope_ci >= 0
     // restricts to one console; scope_ri >= 0 further restricts to one repo.
     void GotoSearch(const std::string &query, int scope_ci = -1,
@@ -827,7 +879,7 @@ class MainApplication : public pu::ui::Application {
     void FinishSearch();
     static void SearchThread(void *arg);
     void GotoCache();
-    void GotoManageData();
+    void GotoTransfers();
     void GotoViewLogs();
     void GotoDebugLog();
     void GotoXferLog();
@@ -858,6 +910,7 @@ class MainApplication : public pu::ui::Application {
 
     // LAN collection import helpers.
     void ImportStart(bool onboarding = false);
+    void ExportStart(); // mirror of import: serve this console's collection to a PC
     void UpdateWifiStart(); // same receiver, update-flavored screen + page
     void ImportReturn(); // where the import flow lands when it ends
     void ImportTick(); // serve one request per frame while the screen is open

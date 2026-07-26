@@ -53,6 +53,15 @@
   button.sm{padding:5px 10px;font-size:13px;border-radius:8px}
   button.danger{color:var(--red);border-color:var(--btn-danger-border)}
   button.danger:hover{background:var(--btn-danger-hover);border-color:var(--red)}
+  /* header toolbar: square, colour-coded icon buttons (tooltip carries the label) */
+  .iconbtn{font-size:17px;line-height:1;padding:7px 11px;border-radius:9px}
+  .iconbtn.act-blue{color:var(--accent-lite);border-color:var(--accent)}
+  .iconbtn.act-blue:hover{border-color:var(--accent-lite)}
+  .iconbtn.act-green{color:var(--green);border-color:var(--tag-on-border)}
+  .iconbtn.act-green:hover{border-color:var(--green)}
+  .iconbtn.act-amber{color:var(--amber);border-color:var(--warn-border)}
+  .iconbtn.act-amber:hover{border-color:var(--amber)}
+  .toolsep{width:1px;height:22px;background:var(--line);margin:0 4px}
   input,select{font:inherit;color:var(--text);background:var(--bg-input);
     border:1px solid var(--line);border-radius:8px;padding:7px 9px;width:100%; transition: background 0.2s;}
   input:focus,select:focus{outline:none;border-color:var(--accent)}
@@ -163,12 +172,12 @@
 <header>
   <h1><img class="applogo" alt="" src="data:image/png;base64,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"><b>Haul</b><i>NX</i> &nbsp;App Utility</h1>
   <div class="sp"></div>
-  <button id="btnCredsOpen" class="ghost" title="archive.org credentials"
-    style="font-size:16px; padding:4px 8px;">⚙️</button>
-  <button id="btnTheme" class="ghost" title="Toggle theme" style="font-size:16px; padding:4px 8px;">☀️</button>
-  <button id="btnImport">Import JSON…</button>
-  <button id="btnSend" title="Send to, or fetch from, a Switch running HaulNX">Switch transfer…</button>
-  <button id="btnExport" class="primary">Export dl_sources.json</button>
+  <button id="btnImport" class="iconbtn act-blue" title="Import a dl_sources.json from disk" aria-label="Import JSON">📂</button>
+  <button id="btnExport" class="iconbtn act-green" title="Export dl_sources.json to disk" aria-label="Export JSON">💾</button>
+  <button id="btnSend" class="iconbtn act-amber" title="Send to, or fetch from, a Switch running HaulNX" aria-label="Switch transfer">📡</button>
+  <span class="toolsep"></span>
+  <button id="btnCredsOpen" class="iconbtn ghost" title="archive.org credentials" aria-label="Credentials">🔑</button>
+  <button id="btnTheme" class="iconbtn ghost" title="Toggle theme" aria-label="Toggle theme">☀️</button>
 </header>
 
 <div class="modal" id="sendModal">
@@ -181,7 +190,8 @@
     </div>
     <div class="sheet-bd">
       <div class="tabs" style="margin-top:14px">
-        <button id="sendTabCol" class="sm act">Collection</button>
+        <button id="sendTabExport" class="sm act">Export collection</button>
+        <button id="sendTabImport" class="sm">Import collection</button>
         <button id="sendTabNro" class="sm">App update (.nro)</button>
       </div>
       <div class="row">
@@ -190,17 +200,22 @@
         <div style="flex:0 0 74px"><label class="fld">Port</label>
           <input id="sendPort" spellcheck="false" inputmode="numeric" autocomplete="off"></div>
         <div style="flex:0 0 104px"><label class="fld">Code</label>
-          <input id="sendCode" placeholder="3d2f66" spellcheck="false" maxlength="6" autocomplete="off"></div>
+          <input id="sendCode" placeholder="4821" spellcheck="false" inputmode="numeric" maxlength="4" autocomplete="off"></div>
       </div>
       <div class="hint">Shown on the Switch as <code>IP:PORT/CODE</code>. The IP and
         port are remembered; the code changes each time you open the receive screen.</div>
-      <div id="sendPaneCol">
-        <div class="hint">Both directions use the same screen on the Switch: open
-          <b>Settings &rsaquo; Manage data &rsaquo; Import collection</b>, which
-          shows the address to type above. <b>Get</b> loads the collection the
-          console is running on into this editor; <b>Send</b> pushes what you're
-          editing back to it. Leave that screen open — it stops listening once a
-          file arrives, and you confirm the import there.</div>
+      <div id="sendPaneExport">
+        <div class="hint">Pushes the collection you're editing here to the console.
+          On the Switch, open <b>Settings &rsaquo; Manage data &rsaquo; Import
+          collection</b> — it shows the address to type above — then hit <b>Send</b>.
+          Leave that screen open: it stops listening once the file arrives, and you
+          confirm the import there.</div>
+      </div>
+      <div id="sendPaneImport" style="display:none">
+        <div class="hint">Loads the collection the console is currently running into
+          this editor, so you can edit it and send it back. Open the same
+          <b>Import collection</b> screen on the Switch for the address, then hit
+          <b>Get from Switch</b>.</div>
       </div>
       <div id="sendPaneNro" style="display:none">
         <div class="row" style="margin-top:10px">
@@ -208,8 +223,7 @@
         </div>
         <div class="hint">Pushes a freshly built <b>HaulNX .nro</b> to the console
           — no USB cable needed, and the same version as installed is fine. On
-          the Switch, open <b>Settings &rsaquo; Check for updates &rsaquo; Over
-          Wi&#8209;Fi</b>; you confirm the install there and restart to switch
+          the Switch, open <b>Settings &rsaquo; Updates &rsaquo; Update app over Wi&#8209;Fi</b>; you confirm the install there and restart to switch
           to the new build.</div>
       </div>
       <div id="sendMsg" class="hint"></div>
@@ -781,6 +795,7 @@ $("#btnSend").onclick=()=>{
   $("#sendIp").value=savedIp||"192.168.";
   $("#sendPort").value=localStorage.getItem("switchPort")||"8080";
   $("#sendCode").value="";           // one-time code — never restored
+  sendTab("export");                 // land on Export, normalise footer buttons
   $("#sendModal").classList.add("on");
   // On a repeat visit the IP is already known, so the only thing left to type is
   // the code; jump straight there. First-time, land on the IP.
@@ -792,32 +807,40 @@ $("#sendModal").onclick=e=>{ if(e.target.id==="sendModal") $("#sendModal").class
 ["#sendIp","#sendPort","#sendCode"].forEach(sel=>{
   $(sel).addEventListener("keydown",e=>{ if(e.key==="Enter") $("#sendGo").click(); });
 });
-// Convenience: paste the whole "192.168.4.96:8080/3d2f66" the Switch shows into
+// Convenience: paste the whole "192.168.4.96:8080/4821" the Switch shows into
 // the IP box and it splits itself across the three fields.
 $("#sendIp").addEventListener("input",()=>{
   const v=$("#sendIp").value;
   if(!/[:\/]/.test(v)) return;
-  const m=v.replace(/^https?:\/\//,"").match(/^([^:\/\s]+)(?::(\d+))?(?:\/([0-9a-fA-F]+))?/);
+  const m=v.replace(/^https?:\/\//,"").match(/^([^:\/\s]+)(?::(\d+))?(?:\/(\d+))?/);
   if(!m) return;
   $("#sendIp").value=m[1];
   if(m[2]) $("#sendPort").value=m[2];
-  if(m[3]){ $("#sendCode").value=m[3].slice(0,6); $("#sendCode").focus(); }
+  if(m[3]){ $("#sendCode").value=m[3].slice(0,4); $("#sendCode").focus(); }
 });
 
-// Two things can go over the wire: the collection being edited, or a built
-// .nro to install (for testing new builds without a USB cable). Same receiver
-// on the Switch either way — it tells them apart by content.
-function sendTab(nro){
-  $("#sendTabCol").classList.toggle("act",!nro);
-  $("#sendTabNro").classList.toggle("act",nro);
-  $("#sendPaneCol").style.display = nro?"none":"";
-  $("#sendPaneNro").style.display = nro?"":"none";
-  // Only a collection can be fetched back: the console has no .nro to hand out.
-  $("#sendGet").style.display = nro?"none":"";
+// Three things can go over the wire: push the collection you're editing (Export),
+// pull the one the console is running (Import), or push a built .nro to install
+// (for testing new builds without a USB cable). Same receiver on the Switch
+// either way — it tells them apart by content.
+function sendTab(which){ // "export" | "import" | "nro"
+  $("#sendTabExport").classList.toggle("act",which==="export");
+  $("#sendTabImport").classList.toggle("act",which==="import");
+  $("#sendTabNro").classList.toggle("act",which==="nro");
+  $("#sendPaneExport").style.display = which==="export"?"":"none";
+  $("#sendPaneImport").style.display = which==="import"?"":"none";
+  $("#sendPaneNro").style.display    = which==="nro"?"":"none";
+  // Import is the only pull: it uses its own Get button as the action; the
+  // other two push, so they use Send.
+  const imp = which==="import";
+  $("#sendGet").style.display = imp?"":"none";
+  $("#sendGet").classList.toggle("primary",imp);
+  $("#sendGo").style.display  = imp?"none":"";
   $("#sendMsg").textContent="";
 }
-$("#sendTabCol").onclick=()=>sendTab(false);
-$("#sendTabNro").onclick=()=>sendTab(true);
+$("#sendTabExport").onclick=()=>sendTab("export");
+$("#sendTabImport").onclick=()=>sendTab("import");
+$("#sendTabNro").onclick=()=>sendTab("nro");
 
 // The three fields, read back as the one URL both directions hang off:
 // "IP : PORT / CODE", where the code is the one-time value the receiver
@@ -825,13 +848,13 @@ $("#sendTabNro").onclick=()=>sendTab(true);
 function switchAddr(){
   const host=$("#sendIp").value.trim().replace(/^https?:\/\//,"").replace(/[:\/].*$/,"");
   const port=($("#sendPort").value.trim()||"8080").replace(/\D/g,"")||"8080";
-  const code=$("#sendCode").value.trim().replace(/[^0-9a-fA-F]/g,"").toLowerCase();
+  const code=$("#sendCode").value.trim().replace(/\D/g,"");
   if(!/^\d{1,3}(\.\d{1,3}){3}$/.test(host)){
     $("#sendMsg").innerHTML='<div class="warn">Enter the Switch\'s IP, e.g. 192.168.4.96.</div>';
     return null;
   }
   if(!code){
-    $("#sendMsg").innerHTML='<div class="warn">Enter the code shown after the / on the Switch, e.g. 3d2f66.</div>';
+    $("#sendMsg").innerHTML='<div class="warn">Enter the 4-digit code shown after the / on the Switch, e.g. 4821.</div>';
     return null;
   }
   localStorage.setItem("switchIp",host);

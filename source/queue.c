@@ -219,7 +219,7 @@ static bool ex_progress(void *ud, const char *entry, int done,
 
 /* Append a download outcome to the history log shown in Settings. */
 static void log_download(const QueueItem *it, const char *status) {
-    fs_mkdir_p(CONFIG_DIR);
+    fs_mkdir_p(LOGS_DIR);
     char ts[32] = "";
     time_t t = time(NULL);
     struct tm tmv;
@@ -318,7 +318,7 @@ static void save_locked(void) {
         g_batch_dirty = true; /* one write when the batch closes */
         return;
     }
-    fs_mkdir_p(CONFIG_DIR);
+    fs_mkdir_p(DATA_DIR);
     FILE *f = fopen(QUEUE_STATE_PATH, "wb");
     if (!f) {
         return;
@@ -342,6 +342,8 @@ static void save_locked(void) {
         json_write_escaped(f, it->name);
         fputs(",\"target\":", f);
         json_write_escaped(f, it->target);
+        fputs(",\"dest\":", f);
+        json_write_escaped(f, it->dest);
         fputs(",\"md5\":", f);
         json_write_escaped(f, it->md5);
         /* "downloaded": the file is fully on disk (past the download phase),
@@ -465,6 +467,10 @@ static void queue_load(void) {
                           it->name, sizeof(it->name));
                 json_copy(body, tok, json_obj_get(body, tok, child, "target"),
                           it->target, sizeof(it->target));
+                /* Absent "dest" (older queue.json) leaves it empty, so the item
+                 * falls back to the default <roms_root>/<target>. */
+                json_copy(body, tok, json_obj_get(body, tok, child, "dest"),
+                          it->dest, sizeof(it->dest));
                 json_copy(body, tok, json_obj_get(body, tok, child, "md5"),
                           it->md5, sizeof(it->md5));
                 /* queue.json is ours, but the size in it originally came off the
@@ -517,6 +523,51 @@ static void set_fail(QueueItem *it, const char *reason) {
     log_download(it, reason);
 }
 
+/* The owning worker was asked to stop this item (cancel set). If a requeue was
+ * also requested (queue_requeue: Retry/Redownload from a stuck verify/unzip),
+ * reset it to QUEUED so the picker runs it again — dropping the .part `tmp`
+ * only for a full redownload — instead of marking it CANCELLED. Returns true if
+ * the item was requeued (caller should just return), false if it was cancelled.
+ * Call from a worker that owns `it` and holds no lock. */
+static bool finish_cancel(QueueItem *it, const char *tmp) {
+    if (it->requeue) {
+        if (it->requeue == 2) {
+            remove(tmp); /* redownload: pull the file again from scratch */
+        }
+        mutexLock(&g_mtx);
+        it->requeue = 0;
+        it->cancel = false;
+        it->pause = false;
+        it->now = 0;
+        it->total = 0;
+        it->speed = 0;
+        it->ex_files = 0;
+        it->http_code = 0;
+        it->fail_reason[0] = '\0';
+        it->status = Q_QUEUED; /* keep seq: re-runs in its current position */
+        save_locked();
+        mutexUnlock(&g_mtx);
+        return true;
+    }
+    remove(tmp);
+    it->status = Q_CANCELLED;
+    log_download(it, "cancelled");
+    return false;
+}
+
+/* Final install directory for an item: its snapshotted custom `dest` when set,
+ * otherwise the default <roms_root>/<sanitized target>. `safet` is the already
+ * traversal-checked target. A custom dest is a locally-entered path (not from an
+ * imported collection), so it is trusted as-is like the roms root itself. */
+static void item_destdir(const QueueItem *it, const char *safet, char *out,
+                         size_t out_sz) {
+    if (it->dest[0]) {
+        snprintf(out, out_sz, "%s", it->dest);
+    } else {
+        snprintf(out, out_sz, "%s/%s", g_roms_root, safet);
+    }
+}
+
 static void process_item(QueueItem *it) {
     /* Never trust the remote filename or the console folder as a filesystem
      * path: the folder ("target") comes from the imported collection, which can
@@ -539,7 +590,7 @@ static void process_item(QueueItem *it) {
     fs_ensure_parent(tmp);
 
     char destdir[1200];
-    snprintf(destdir, sizeof(destdir), "%s/%s", g_roms_root, safet);
+    item_destdir(it, safet, destdir, sizeof(destdir));
 
     /* Resume from whatever's already on disk from a prior attempt/session. */
     uint64_t have = 0;
@@ -643,9 +694,7 @@ static void process_item(QueueItem *it) {
         return;
     }
     if (it->cancel) {
-        remove(tmp);
-        it->status = Q_CANCELLED;
-        log_download(it, "cancelled");
+        finish_cancel(it, tmp); /* requeue (Retry/Redownload) or mark cancelled */
         return;
     }
     /* Salvage a transfer that delivered the whole file but then errored while
@@ -714,9 +763,7 @@ static void process_item(QueueItem *it) {
         boost_release();
         if (!md5ok) {
             if (it->cancel) {
-                remove(tmp);
-                it->status = Q_CANCELLED;
-                log_download(it, "cancelled");
+                finish_cancel(it, tmp); /* requeue or mark cancelled */
             } else {
                 /* We couldn't read the file back to hash it — an SD hiccup,
                  * not a verdict on the bytes, which already passed the size
@@ -770,7 +817,7 @@ static void install_item(QueueItem *it) {
     char tmp[1200];
     snprintf(tmp, sizeof(tmp), "%s/%s_%s.part", DL_TMP_DIR, safet, safe);
     char destdir[1200];
-    snprintf(destdir, sizeof(destdir), "%s/%s", g_roms_root, safet);
+    item_destdir(it, safet, destdir, sizeof(destdir));
 
     fs_mkdir_p(destdir);
     /* it->now switches meaning here: downloaded bytes -> archive bytes
@@ -790,9 +837,7 @@ static void install_item(QueueItem *it) {
         return;
     }
     if (it->cancel) {
-        remove(tmp);
-        it->status = Q_CANCELLED;
-        log_download(it, "cancelled");
+        finish_cancel(it, tmp); /* requeue (Retry/Redownload) or mark cancelled */
         return;
     }
     if (n > 0) {
@@ -1030,7 +1075,7 @@ void queue_init(const char *roms_root, int max_dl) {
     if (g_dl_count == 0 && !ex_ok) {
         g_run = false;
     }
-    fs_mkdir_p(CONFIG_DIR);
+    fs_mkdir_p(LOGS_DIR);
     FILE *f = fopen(LOG_PATH, "a");
     if (f) {
         char cores[32] = "";
@@ -1078,7 +1123,7 @@ void queue_exit(void) {
 
 bool queue_add(const char *url, const char *name, const char *target,
                const char *auth, uint64_t size, bool is_archive,
-               const char *md5) {
+               const char *md5, const char *dest) {
     mutexLock(&g_mtx);
     int slot = -1;
     for (int i = 0; i < QUEUE_MAX; i++) {
@@ -1096,6 +1141,7 @@ bool queue_add(const char *url, const char *name, const char *target,
     snprintf(it->url, sizeof(it->url), "%s", url);
     snprintf(it->name, sizeof(it->name), "%s", name);
     snprintf(it->target, sizeof(it->target), "%s", target);
+    snprintf(it->dest, sizeof(it->dest), "%s", dest ? dest : "");
     snprintf(it->auth, sizeof(it->auth), "%s", auth ? auth : "");
     snprintf(it->md5, sizeof(it->md5), "%s", md5 ? md5 : "");
     /* Backstop: every download enters here, whatever route the caller took to
@@ -1226,6 +1272,40 @@ void queue_retry(int slot) {
         it->fail_reason[0] = '\0';
         /* Keep the original seq so the item resumes in its current list
          * position (and is picked promptly) instead of jumping to the bottom. */
+        it->status = Q_QUEUED;
+        save_locked();
+    }
+    mutexUnlock(&g_mtx);
+}
+
+void queue_requeue(int slot, bool wipe) {
+    if (slot < 0 || slot >= QUEUE_MAX) {
+        return;
+    }
+    mutexLock(&g_mtx);
+    QueueItem *it = &g_items[slot];
+    QStatus s = it->status;
+    if (s == Q_DOWNLOADING || s == Q_VERIFYING || s == Q_AWAIT_EXTRACT ||
+        s == Q_EXTRACTING) {
+        /* Owned by a download/extract worker (or waiting for the extract
+         * thread): ask it to hand the item back via the cancel handoff. The
+         * worker resets it to QUEUED in finish_cancel — dropping the .part only
+         * for a redownload — so we don't touch its files from here. */
+        it->requeue = wipe ? 2 : 1;
+        it->cancel = true;
+    } else if (s == Q_QUEUED || s == Q_PAUSED || s == Q_FAILED ||
+               s == Q_CANCELLED) {
+        /* No worker owns it: reset it in place. A resume re-validates the .part,
+         * so a "redownload" here just restarts from zero on the next run. */
+        it->cancel = false;
+        it->pause = false;
+        it->requeue = 0;
+        it->now = 0;
+        it->total = 0;
+        it->speed = 0;
+        it->ex_files = 0;
+        it->http_code = 0;
+        it->fail_reason[0] = '\0';
         it->status = Q_QUEUED;
         save_locked();
     }

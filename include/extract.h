@@ -29,6 +29,18 @@ typedef bool (*extract_cb)(void *userdata, const char *entry_name, int done,
 int extract_archive(const char *src, const char *dest_dir, extract_cb cb,
                     void *userdata, int *out_overwrites);
 
+/* Runtime extraction knobs for on-device A/B benchmarking. The app sets these
+ * from Prefs at startup and whenever a toggle changes; extraction snapshots the
+ * current values at the start of each archive. The defaults reproduce the
+ * shipped behavior, so an app that never calls the setter is unaffected. */
+typedef struct {
+    bool bench;     /* append a per-archive throughput line to the bench log */
+    bool prealloc;  /* grow each output file to its final size up front */
+    int  chunk_mb;  /* write-coalescing chunk size in MB: 1, 2, or 4 */
+} ExtractTunables;
+
+void extract_set_tunables(const ExtractTunables *t);
+
 #ifdef __cplusplus
 }
 #endif

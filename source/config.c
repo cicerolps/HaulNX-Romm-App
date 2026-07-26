@@ -22,6 +22,52 @@ static void sset(char *dst, size_t dsz, const char *src) {
     dst[i] = '\0';
 }
 
+/* ---- on-disk layout migration ---------------------------------------- */
+
+void app_migrate_layout(void) {
+    /* Builds up to 1.0.2 wrote every config file and log directly under
+     * CONFIG_DIR. They now live in config/ and logs/. Relocate any leftover so
+     * an in-place update keeps the user's collections, credentials, prefs,
+     * queue, size cache and log history instead of silently starting fresh.
+     * Each move is guarded twice: it only runs when the old file is present and
+     * the new one is not, so it never clobbers a current file and stops being a
+     * no-op-with-a-stat once everything has moved. fs_move creates the parent. */
+    fs_mkdir_p(DATA_DIR);
+    fs_mkdir_p(LOGS_DIR);
+    static const struct {
+        const char *old;
+        const char *cur;
+    } moves[] = {
+        /* config/ — JSON state and derived caches */
+        {CONFIG_DIR "/dl_sources.json", SOURCES_PATH},
+        {CONFIG_DIR "/dl_sources.bak.json", SOURCES_BAK_PATH},
+        {CONFIG_DIR "/dl_sources.bak2.json", SOURCES_BAK2_PATH},
+        {CONFIG_DIR "/credentials.json", CREDS_PATH},
+        {CONFIG_DIR "/prefs.json", PREFS_PATH},
+        {CONFIG_DIR "/queue.json", QUEUE_STATE_PATH},
+        {CONFIG_DIR "/inst_sizes.json", INST_SIZES_PATH},
+        /* logs/ — the live logs and their one rotated ".1" generation, moved
+         * together so a log's history isn't split across two folders */
+        {CONFIG_DIR "/debug.log", LOG_PATH},
+        {CONFIG_DIR "/debug.log.1", LOG_PATH ".1"},
+        {CONFIG_DIR "/exbench.log", EXBENCH_PATH},
+        {CONFIG_DIR "/exbench.log.1", EXBENCH_PATH ".1"},
+        {CONFIG_DIR "/transfers.log", XFERLOG_PATH},
+        {CONFIG_DIR "/transfers.log.1", XFERLOG_PATH ".1"},
+        {CONFIG_DIR "/speedtest.log", SPEEDLOG_PATH},
+        {CONFIG_DIR "/speedtest.log.1", SPEEDLOG_PATH ".1"},
+        {CONFIG_DIR "/downloads.log", DLLOG_PATH},
+        {CONFIG_DIR "/downloads.log.1", DLLOG_PATH ".1"},
+        {CONFIG_DIR "/downloads.jsonl", DLLOG_JSON},
+        {CONFIG_DIR "/downloads.jsonl.1", DLLOG_JSON ".1"},
+    };
+    for (size_t i = 0; i < sizeof(moves) / sizeof(moves[0]); i++) {
+        if (fs_exists(moves[i].old) && !fs_exists(moves[i].cur)) {
+            fs_move(moves[i].old, moves[i].cur);
+        }
+    }
+}
+
 /* Add a name to the supported-console list if absent and there's room. */
 static void add_supported(SourcesConfig *cfg, const char *name) {
     if (!name || !name[0] || cfg->supported_count >= MAX_CONSOLES) {
@@ -47,7 +93,7 @@ static void seed_from_romfs(void) {
     if (!def) {
         return;
     }
-    fs_mkdir_p(CONFIG_DIR);
+    fs_mkdir_p(DATA_DIR);
     FILE *f = fopen(SOURCES_PATH, "wb");
     if (f) {
         fwrite(def, 1, len, f);
@@ -94,6 +140,7 @@ static void merge_supported_from_romfs(SourcesConfig *cfg) {
 }
 
 static bool console_hidden_by_default(const char *name); /* defined below */
+static bool console_is_new(const char *name);            /* defined below */
 
 /* Ensure every supported console has a (possibly empty) group so the Browse tab
  * lists all known consoles up front, not just those with repos — giving users a
@@ -118,6 +165,9 @@ static void seed_console_groups(SourcesConfig *cfg) {
         sset(g->console, sizeof(g->console), name);
         sset(g->target, sizeof(g->target), name);
         g->shown = !console_hidden_by_default(name);
+        /* New (post-launch) consoles default off on Installed too; the original
+         * launch set keeps its prior "shown on Installed" default. */
+        g->shown_installed = !console_is_new(name);
     }
 }
 
@@ -127,6 +177,11 @@ void repo_set_url_default(Repo *r) {
         snprintf(tmp, sizeof(tmp), "https://archive.org/download/%s", r->id);
         snprintf(r->download_base, sizeof(r->download_base), "%s", tmp);
     }
+}
+
+const char *config_console_folder(SourcesConfig *cfg, const char *target) {
+    ConsoleGroup *g = config_find_console(cfg, target);
+    return (g && g->folder[0]) ? g->folder : "";
 }
 
 ConsoleGroup *config_find_console(SourcesConfig *cfg, const char *name) {
@@ -139,17 +194,16 @@ ConsoleGroup *config_find_console(SourcesConfig *cfg, const char *name) {
     return NULL;
 }
 
-/* Consoles that ship hidden on a fresh install: niche arcade / dual-screen
- * systems, plus the wider set of retro platforms added after the initial
- * release — most users won't want them all cluttering the Browse list. They
- * still exist and can be re-shown via Settings -> Manage consoles. Only affects
- * newly seeded consoles; an existing saved config keeps whatever the user set,
- * so an app update that adds these leaves already-shown consoles alone. */
-static bool console_hidden_by_default(const char *name) {
-    static const char *hidden[] = {
-        /* original hidden set */
-        "atomiswave", "naomi",
-        /* added post-launch — off by default, user opts in */
+/* Consoles added after the initial release. They ship disabled in BOTH the
+ * Browse and the Installed lists, so an app update never lights up systems the
+ * user never asked for: an existing library keeps exactly the consoles it had,
+ * and these are opted into per-section via Settings -> Manage consoles. The
+ * original launch set is deliberately NOT listed here, so it keeps its prior
+ * defaults (shown on Browse unless in the original hidden set below, and shown
+ * on Installed). Only affects newly seeded consoles; a saved config is never
+ * disturbed. */
+static bool console_is_new(const char *name) {
+    static const char *added[] = {
         "fds", "virtual-boy", "pokemon-mini", "game-and-watch", "sg-1000",
         "sega-32x", "pc-engine", "pc-engine-cd", "supergrafx", "pc-fx",
         "neo-geo", "neo-geo-cd", "neo-geo-pocket", "neo-geo-pocket-color",
@@ -158,14 +212,28 @@ static bool console_hidden_by_default(const char *name) {
         "odyssey2", "vectrex", "channel-f", "3do", "cd-i", "supervision",
         "arcade", "fbneo",
         /* experimental — Wii U, playable only via the unofficial Cemu Switch
-         * port; hidden so it doesn't imply first-class on-device support */
+         * port; off by default so it doesn't imply first-class on-device
+         * support */
         "wiiu"};
-    for (size_t i = 0; i < sizeof(hidden) / sizeof(hidden[0]); i++) {
-        if (strcasecmp(name, hidden[i]) == 0) {
+    for (size_t i = 0; i < sizeof(added) / sizeof(added[0]); i++) {
+        if (strcasecmp(name, added[i]) == 0) {
             return true;
         }
     }
     return false;
+}
+
+/* Consoles hidden from the Browse list on a fresh install. "atomiswave" and
+ * "naomi" were hidden at launch (niche arcade systems) and stay that way to
+ * match the original defaults; every post-launch console is hidden from Browse
+ * too. Consoles can be re-shown via Settings -> Manage consoles. Only affects
+ * newly seeded consoles; an existing saved config keeps whatever the user set. */
+static bool console_hidden_by_default(const char *name) {
+    if (strcasecmp(name, "atomiswave") == 0 ||
+        strcasecmp(name, "naomi") == 0) {
+        return true;
+    }
+    return console_is_new(name);
 }
 
 ConsoleGroup *config_add_console(SourcesConfig *cfg, const char *name) {
@@ -184,6 +252,7 @@ ConsoleGroup *config_add_console(SourcesConfig *cfg, const char *name) {
     sset(g->console, sizeof(g->console), name);
     sset(g->target, sizeof(g->target), name);
     g->shown = !console_hidden_by_default(name);
+    g->shown_installed = !console_is_new(name);
     return g;
 }
 
@@ -294,6 +363,16 @@ static bool load_grouped(const char *js, jsmntok_t *tok, SourcesConfig *cfg) {
             /* Absent "shown" defaults to true so existing configs are unchanged. */
             int shtok = json_obj_get(js, tok, child, "shown");
             g->shown = (shtok < 0) ? true : json_bool(js, tok, shtok);
+            /* Absent "shown_installed" defaults to true: pre-existing configs
+             * keep every console visible on the Installed tab as before. */
+            int sitok = json_obj_get(js, tok, child, "shown_installed");
+            g->shown_installed = (sitok < 0) ? true : json_bool(js, tok, sitok);
+            /* Absent "pinned" defaults to false — an unpinned console. */
+            int pntok = json_obj_get(js, tok, child, "pinned");
+            g->pinned = (pntok < 0) ? false : json_bool(js, tok, pntok);
+            /* Absent "folder" leaves it empty — the default <roms_root>/<target>. */
+            json_copy(js, tok, json_obj_get(js, tok, child, "folder"),
+                      g->folder, sizeof(g->folder));
             int reps = json_obj_get(js, tok, child, "repos");
             if (reps >= 0 && tok[reps].type == JSMN_ARRAY) {
                 int rc = tok[reps].size;
@@ -588,7 +667,7 @@ static bool commit_staged(FILE *f, const char *tmp, const char *dst) {
 }
 
 bool config_save(const SourcesConfig *cfg) {
-    fs_mkdir_p(CONFIG_DIR);
+    fs_mkdir_p(DATA_DIR);
     /* Stage to a temp file and move it into place. dl_sources.json is the entire
      * collection list, so truncating it in place means a full SD card or a console
      * that dies mid-write leaves the user with nothing. Same pattern a finished
@@ -605,6 +684,15 @@ bool config_save(const SourcesConfig *cfg) {
         fputs(",\n      \"target\": ", f);
         json_write_escaped(f, g->target);
         fprintf(f, ",\n      \"shown\": %s", g->shown ? "true" : "false");
+        fprintf(f, ",\n      \"shown_installed\": %s",
+                g->shown_installed ? "true" : "false");
+        fprintf(f, ",\n      \"pinned\": %s", g->pinned ? "true" : "false");
+        /* Only emit "folder" when a custom path is set, so the common case
+         * (default install location) leaves the file uncluttered. */
+        if (g->folder[0]) {
+            fputs(",\n      \"folder\": ", f);
+            json_write_escaped(f, g->folder);
+        }
         fputs(",\n      \"repos\": [\n", f);
         for (int r = 0; r < g->repo_count; r++) {
             const Repo *rp = &g->repos[r];
@@ -655,7 +743,7 @@ void creds_load(Credentials *c) {
 }
 
 bool creds_save(const Credentials *c) {
-    fs_mkdir_p(CONFIG_DIR);
+    fs_mkdir_p(DATA_DIR);
     /* Staged, and the return value is honest about the outcome. Opening
      * CREDS_PATH "wb" directly truncated the file before the first byte was
      * written, so a card that filled up mid-save destroyed the working key as
@@ -692,10 +780,14 @@ void prefs_load(Prefs *p) {
     strcpy(p->theme, "dark");
     p->card_view = true;
     p->roms_override[0] = '\0';
+    p->custom_folders = false;
     p->pinned_dir_count = 0;
     p->filter_exts = true;
     p->exclude_ext_count = 0;
     p->skip_installed = true;
+    p->ex_bench = false;     /* benchmarking off by default */
+    p->ex_prealloc = true;   /* shipped behavior: preallocate output files */
+    p->ex_chunk_mb = 1;      /* shipped behavior: 1 MB write chunks */
     prefs_ext_seed_defaults(p);
     size_t len = 0;
     char *js = json_read_file(PREFS_PATH, &len);
@@ -757,6 +849,10 @@ void prefs_load(Prefs *p) {
             json_copy(js, tok, idx, p->roms_override,
                       sizeof(p->roms_override));
         }
+        idx = json_obj_get(js, tok, 0, "customFolders");
+        if (idx >= 0) {
+            p->custom_folders = json_bool(js, tok, idx);
+        }
         idx = json_obj_get(js, tok, 0, "filterExts");
         if (idx >= 0) {
             p->filter_exts = json_bool(js, tok, idx);
@@ -764,6 +860,19 @@ void prefs_load(Prefs *p) {
         idx = json_obj_get(js, tok, 0, "skipInstalled");
         if (idx >= 0) {
             p->skip_installed = json_bool(js, tok, idx);
+        }
+        idx = json_obj_get(js, tok, 0, "exBench");
+        if (idx >= 0) {
+            p->ex_bench = json_bool(js, tok, idx);
+        }
+        idx = json_obj_get(js, tok, 0, "exPrealloc");
+        if (idx >= 0) {
+            p->ex_prealloc = json_bool(js, tok, idx);
+        }
+        idx = json_obj_get(js, tok, 0, "exChunkMb");
+        if (idx >= 0) {
+            int v = (int)json_u64(js, tok, idx);
+            if (v == 1 || v == 2 || v == 4) p->ex_chunk_mb = v;
         }
         idx = json_obj_get(js, tok, 0, "excludeExts");
         if (idx >= 0 && tok[idx].type == JSMN_ARRAY) {
@@ -807,7 +916,7 @@ void prefs_load(Prefs *p) {
 }
 
 bool prefs_save(const Prefs *p) {
-    fs_mkdir_p(CONFIG_DIR);
+    fs_mkdir_p(DATA_DIR);
     /* Staged for the same reason as the other two: a failed in-place write left
      * a truncated prefs.json, which parses as "no keys" and silently resets
      * every setting — including the pinned dirs and extension filters the user
@@ -836,6 +945,8 @@ bool prefs_save(const Prefs *p) {
     fprintf(f, ",\n  \"cardView\": %s", p->card_view ? "true" : "false");
     fputs(",\n  \"romsOverride\": ", f);
     json_write_escaped(f, p->roms_override);
+    fprintf(f, ",\n  \"customFolders\": %s",
+            p->custom_folders ? "true" : "false");
     fputs(",\n  \"pinnedDirs\": [", f);
     for (int i = 0; i < p->pinned_dir_count; i++) {
         if (i) {
@@ -844,9 +955,13 @@ bool prefs_save(const Prefs *p) {
         json_write_escaped(f, p->pinned_dirs[i]);
     }
     fprintf(f, "],\n  \"skipInstalled\": %s,\n  \"filterExts\": %s,\n"
+               "  \"exBench\": %s,\n  \"exPrealloc\": %s,\n  \"exChunkMb\": %d,\n"
                "  \"excludeExts\": [",
             p->skip_installed ? "true" : "false",
-            p->filter_exts ? "true" : "false");
+            p->filter_exts ? "true" : "false",
+            p->ex_bench ? "true" : "false",
+            p->ex_prealloc ? "true" : "false",
+            p->ex_chunk_mb);
     for (int i = 0; i < p->exclude_ext_count; i++) {
         if (i) {
             fputs(", ", f);

@@ -27,17 +27,26 @@ extern "C" {
  * neither POST a file nor fetch the config export without it.
  *
  * It is also the only thing standing between a LAN peer and replacing the app
- * binary, and there is no attempt limiter behind it, so it is sized for guessing
- * resistance rather than brevity: 8 characters from a 32-symbol alphabet is 40
- * bits, against the 24 that six hex characters gave. Still short enough to read
- * off a TV and type on a phone. */
-#define HTTPSRV_TOKEN_LEN 8
+ * binary. It is deliberately a short 4-digit numeric code: it lives only on a
+ * trusted home LAN, the receive screen is open for a moment at a time, and the
+ * code is regenerated every time that screen opens, so the value is being read
+ * off a TV and typed on a phone rather than defended against sustained guessing.
+ * Brevity is the point. */
+#define HTTPSRV_TOKEN_LEN 4
+
+/* Which one-way task the open server is serving. It only picks the page shown
+ * in a browser and whether the config export is offered; POST is still routed
+ * by content, so a file meant for the wrong screen is forgiven. Defaults to
+ * IMPORT because httpsrv_open zeroes the struct. */
+typedef enum {
+    HTTPSRV_MODE_IMPORT = 0, /* receive a collection from a PC (upload page) */
+    HTTPSRV_MODE_EXPORT,     /* hand this console's collection to a PC (GET) */
+    HTTPSRV_MODE_NRO,        /* receive an app .nro build (update page) */
+} HttpSrvMode;
 
 typedef struct {
     int listen_fd;   /* -1 when closed */
-    bool nro_page;   /* serve the app-update page instead of the collection
-                        one (set by the caller after open; transport-neutral —
-                        either kind of file is still accepted on POST) */
+    HttpSrvMode mode; /* set by the caller after open; see HttpSrvMode */
     char token[HTTPSRV_TOKEN_LEN + 1]; /* set by open; caller shows it in the URL */
     char ip[46];     /* our own address, for the Host-header check (may be "") */
     /* One in-flight connection, read a slice per poll so the UI thread never

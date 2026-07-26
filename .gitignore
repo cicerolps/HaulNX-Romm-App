@@ -12,6 +12,7 @@
 /wiki/
 
 # local scratch (icon work, backups)
+/settings icons/
 /icon_prev.jpg
 /icon_full_src.jpg
 /make_icon.py

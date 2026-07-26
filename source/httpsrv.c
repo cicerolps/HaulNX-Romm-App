@@ -122,14 +122,29 @@ static const char PAGE[] =
     "<input type=file name=f accept=\".json,application/json\" required>"
     "</label>"
     "<button id=go disabled>Send to Switch</button>"
-    "</form>"
+    "</form>" UPLOAD_SCRIPT "</div>";
+
+/* The export page, shown while Export collection is open: no upload, just a
+ * link to the collection this console is running on. The export lives under
+ * this page's one-time path; the page is static, so point the link there at
+ * load time rather than baking the code in. */
+static const char PAGE_EXPORT[] =
+    "<!doctype html><meta charset=utf-8>"
+    "<meta name=viewport content=\"width=device-width,initial-scale=1\">"
+    "<title>HaulNX - Export collection</title>" PAGE_CSS
+    "<style>a.dl{display:block;text-align:center;background:var(--accent);"
+    "color:#12161c;border-radius:.5rem;padding:.75rem;font-size:1rem;"
+    "font-weight:600;text-decoration:none;margin:.5rem 0}</style>"
+    "<div class=card>"
+    "<header><img src=\"/logo.png\" alt=\"\">"
+    "<div><h1>Haul<span>NX</span></h1><p>Export collection</p></div></header>"
+    "<p>This console is sharing the collection it is running on.</p>"
+    "<a class=dl href=\"dl_sources.json\" download>Download dl_sources.json</a>"
     "<div class=alt>"
-    "<p>Want to start from what this console is already using?</p>"
-    "<a href=\"dl_sources.json\" download>Download current dl_sources.json</a>"
-    "</div>" UPLOAD_SCRIPT
-    /* The export lives under this page's one-time path; the page is static, so
-     * point the link there at load time instead of baking the code in. */
-    "<script>var xa=document.querySelector('.alt a');"
+    "<p>Or pull it straight into the app utility: "
+    "<b>Send to Switch &rsaquo; Export collection</b>.</p>"
+    "</div>"
+    "<script>var xa=document.querySelector('a.dl');"
     "if(xa)xa.setAttribute('href',"
     "location.pathname.replace(/\\/+$/,'')+'/dl_sources.json');</script>"
     "</div>";
@@ -523,17 +538,22 @@ static int respond_simple(HttpSrv *s, int fd, const char *head) {
         send_resp(fd, "200 OK", "text/html; charset=utf-8", PAGE_OK);
         ret = 2; /* the upload landed safely; nothing is pending */
     } else if (path_is_token(s, p, pl)) {
-        /* The one-time address from the console's screen: the upload form.
-         * Which form depends on the screen that opened the server. */
-        send_resp(fd, "200 OK", "text/html; charset=utf-8",
-                  s->nro_page ? PAGE_NRO : PAGE);
-    } else if (!s->nro_page && pl == tl + 16 && p[0] == '/' &&
+        /* The one-time address from the console's screen. Which page it lands
+         * on depends on the task the screen opened the server for. */
+        const char *page = PAGE;
+        if (s->mode == HTTPSRV_MODE_NRO) {
+            page = PAGE_NRO;
+        } else if (s->mode == HTTPSRV_MODE_EXPORT) {
+            page = PAGE_EXPORT;
+        }
+        send_resp(fd, "200 OK", "text/html; charset=utf-8", page);
+    } else if (s->mode == HTTPSRV_MODE_EXPORT && pl == tl + 16 && p[0] == '/' &&
                strncmp(p + 1, s->token, tl - 1) == 0 &&
                strncmp(p + tl, "/dl_sources.json", 16) == 0) {
         /* Export, at "/<token>/dl_sources.json": hand back the collection the
          * console is running on, so it can be edited and sent straight back.
-         * Token-gated (it lists the user's repos) and only while the IMPORT
-         * screen is open — the update screen has no business exporting. */
+         * Token-gated (it lists the user's repos) and only while the Export
+         * screen is open — import and update have no business exporting. */
         bool sent = send_file(fd, SOURCES_PATH, "application/json",
                               "dl_sources.json");
         if (!sent) {
@@ -750,16 +770,15 @@ bool httpsrv_open(HttpSrv *s) {
     s->listen_fd = fd;
 
     /* The one-time code for this session's URL, from the console's CSPRNG.
-     * A 32-symbol alphabet gets 5 bits out of each random byte instead of the
-     * 4 that hex threw away, and 256 is a whole multiple of 32 so the masking
-     * stays unbiased. '0'/'1' and 'i'/'l' are left out: the code is read off a
-     * screen and typed by hand, and those are the pairs people get wrong.
-     * Everything left is a bare URL path character needing no escaping. */
-    unsigned char rnd[HTTPSRV_TOKEN_LEN];
-    randomGet(rnd, sizeof(rnd));
-    static const char alpha[] = "23456789abcdefghjkmnopqrstuvwxyz";
+     * Plain digits: it is read off a screen and typed by hand, so every symbol
+     * is one keystroke on a numeric pad with no ambiguous letters to misread.
+     * Rejection sampling keeps the digits unbiased — 256 is not a multiple of
+     * 10, so bytes at or above 250 (25*10, the largest usable multiple) are
+     * redrawn rather than folded in and skewing the low digits. */
     for (int i = 0; i < HTTPSRV_TOKEN_LEN; i++) {
-        s->token[i] = alpha[rnd[i] & 0x1f];
+        unsigned char b;
+        do { randomGet(&b, 1); } while (b >= 250);
+        s->token[i] = (char)('0' + (b % 10));
     }
     s->token[HTTPSRV_TOKEN_LEN] = '\0';
 

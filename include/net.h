@@ -68,6 +68,43 @@ bool http_download(const char *url, const char *dest_path,
                    uint64_t resume_from,
                    long *http_code);
 
+/* Which half of the speed test is running (see SpeedProg). */
+typedef enum {
+    SP_IDLE = 0,
+    SP_DOWNLOAD = 1,
+    SP_UPLOAD = 2,
+    SP_DONE = 3,
+} SpeedPhase;
+
+/*
+ * Live state for the diagnostics speed test. net_speedtest_live() (worker
+ * thread) writes these every progress tick; the UI thread reads them each
+ * frame to draw the download/upload meters and sets `cancel` to abort. Plain
+ * scalars shared without a lock — a torn read only mis-draws a single frame,
+ * and `cancel`/`phase` are single-writer. Zero-initialize before starting.
+ */
+typedef struct {
+    volatile int phase;          /* SpeedPhase: current transfer, SP_DONE at end */
+    volatile int cancel;         /* UI sets 1 to abort the transfer */
+    volatile uint64_t dl_now;    /* bytes downloaded so far */
+    volatile uint64_t dl_total;  /* download size (from Content-Length) */
+    volatile uint64_t ul_now;    /* bytes uploaded so far */
+    volatile uint64_t ul_total;  /* upload size (fixed payload) */
+    volatile double dl_bps;      /* live download rate, bytes/sec */
+    volatile double ul_bps;      /* live upload rate, bytes/sec */
+    void *handle;                /* current CURL*, for getinfo in the callback */
+} SpeedProg;
+
+/*
+ * Two-phase speed test: a timed HTTPS download of a fixed filler payload
+ * followed by a timed upload, both discarded, updating *p live throughout.
+ * Returns true only if both phases finished cleanly (2xx, not cancelled); on
+ * success p->dl_bps / p->ul_bps hold the final average rates. Blocks for the
+ * length of both transfers, so run it off the UI thread. Set p->cancel from
+ * another thread to stop early.
+ */
+bool net_speedtest_live(SpeedProg *p);
+
 #ifdef __cplusplus
 }
 #endif

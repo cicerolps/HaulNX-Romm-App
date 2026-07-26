@@ -7,6 +7,61 @@ Notes for each release. `release.sh` pulls the section matching the version in
 `VERSION` and attaches it to the GitHub release. Add a `## <version>` section
 here before running a release.
 
+## 1.1.0
+
+**A redesigned Settings, per-console install folders, a live speed test, and a
+much wider console list.**
+
+**Settings, rebuilt**
+- Settings is now a set of **single-concern sections** — Appearance, Downloads,
+  Filters, Storage, Collection Management, Account & Network, Updates, Logs,
+  Diagnostics and About — each with its own icon, instead of one long list.
+- **Logs** is a top-level section, and **Diagnostics** gains a **speed test**, a
+  **self-test**, and an exportable **debug bundle** for troubleshooting.
+
+**Per-console install folders**
+- **Storage → per-console folders** lets you send each console's downloads to a
+  folder you choose, instead of everything landing under one ROM root. The
+  Installed tab follows those custom folders, so browsing and managing what you
+  have keeps working wherever the files live.
+- Each console row now reads as **icon, full name, (short name)** for clarity.
+
+**More consoles**
+- Added a large batch of systems: Famicom Disk System, Virtual Boy, Pokémon
+  Mini, Game & Watch, SG-1000, Sega 32X, the PC Engine family (incl. SuperGrafx
+  and PC-FX), the Neo Geo family (incl. CD and Pocket), the Atari line
+  (2600/5200/7800/Lynx/Jaguar), WonderSwan (+ Color), ColecoVision,
+  Intellivision, Odyssey², Vectrex, Channel F, 3DO, CD-i, Supervision, and
+  arcade (Arcade / FinalBurn Neo). Existing installs pick them up on update.
+- The **original launch console set keeps its previous defaults**; the newly
+  added systems ship **disabled by default** in both the Browse and Installed
+  console filters, so they're opt-in and don't clutter your lists.
+
+**Speed test**
+- The Diagnostics speed test reports **live upload and download rates** with a
+  progress bar and ETA, rather than a single number at the end.
+
+**Queue**
+- You can now **cancel or retry an item while it's verifying or unpacking**,
+  not only while it's downloading.
+
+**Tidier on-disk layout**
+- App data and logs are now organised into **`config/`** and **`logs/`**
+  subfolders under `sdmc:/switch/HaulNX`, instead of sitting loose in the app
+  folder. On update, existing files (including rotated logs) are **moved into
+  the new folders automatically** — nothing to do by hand.
+
+**App Utility**
+- Bumped to **`appUtility-v1.1.0.html`**.
+
+**Fixes**
+- **Speed test no longer fails against Cloudflare.** The download leg was
+  requesting a payload at the size Cloudflare rejects with HTTP 403, which
+  surfaced as a failed test ("failed, cloudflare"). It now uses a size that
+  stays under that ceiling.
+- Removed the ROM-folder line from the foot of the main Settings page — the ROM
+  folder is managed under Storage now, so it's no longer duplicated there.
+
 ## 1.0.2
 
 **Bulk downloads, Nintendo Wii U support, and a two-way collection transfer.**

@@ -226,7 +226,7 @@ for **restricted** items that require an archive.org account.
 4. Edit the **Access key** and **Secret** — the edit field is pre-filled with the
    current value so it's easy to change.
 
-Keys live only on your SD card (`sdmc:/switch/HaulNX/credentials.json`) and
+Keys live only on your SD card (`sdmc:/switch/HaulNX/config/credentials.json`) and
 are sent only to archive.org hosts, and only over HTTPS.
 
 ### 3. Download

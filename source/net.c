@@ -34,7 +34,7 @@ static void net_log(const char *fmt, ...) {
     if ((tick++ & 63u) == 0) {
         fs_log_rotate(LOG_PATH, LOG_ROTATE_DEBUG);
     }
-    fs_mkdir_p(CONFIG_DIR);
+    fs_mkdir_p(LOGS_DIR);
     FILE *f = fopen(LOG_PATH, "a");
     if (!f) {
         return;
@@ -210,7 +210,7 @@ static char *http_get_impl(CURL *c, const char *url, long *http_code,
     curl_easy_setopt(c, CURLOPT_ACCEPT_ENCODING, "");
     curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, mem_write);
     curl_easy_setopt(c, CURLOPT_WRITEDATA, &m);
-    curl_easy_setopt(c, CURLOPT_TIMEOUT, 60L);
+    curl_easy_setopt(c, CURLOPT_TIMEOUT, 30L);
     curl_easy_setopt(c, CURLOPT_CONNECTTIMEOUT, 20L);
     /* Keep the connection alive between fetches so it stays in the cache. */
     curl_easy_setopt(c, CURLOPT_TCP_KEEPALIVE, 1L);
@@ -254,6 +254,176 @@ char *http_get(const char *url, long *http_code, size_t *out_len) {
     char *r = http_get_impl(c, url, http_code, out_len);
     mutexUnlock(&g_get_mtx);
     return r;
+}
+
+/* Discard sink for the speed test: keep no bytes, so a large timed transfer
+ * never has to fit in RAM. Byte counts come from the progress callback. */
+static size_t null_write(void *ptr, size_t size, size_t nmemb, void *ud) {
+    (void)ptr;
+    (void)ud;
+    return size * nmemb;
+}
+
+/* Filler source for the upload phase: hand curl up to POSTFIELDSIZE bytes. We
+ * only measure how fast they leave, so the contents are irrelevant. */
+static size_t fill_read(char *buf, size_t size, size_t nmemb, void *ud) {
+    uint64_t *left = (uint64_t *)ud;
+    size_t want = size * nmemb;
+    if (want > *left) {
+        want = (size_t)*left;
+    }
+    memset(buf, 'A', want);
+    *left -= want;
+    return want;
+}
+
+/* curl progress tick: mirror the live byte counts into the shared struct, read
+ * the rolling rate straight off the handle, and abort if the UI asked to. */
+static int speed_xfer(void *ud, curl_off_t dltotal, curl_off_t dlnow,
+                      curl_off_t ultotal, curl_off_t ulnow) {
+    SpeedProg *p = (SpeedProg *)ud;
+    double bps = 0.0;
+    if (p->phase == SP_DOWNLOAD) {
+        p->dl_now = (uint64_t)dlnow;
+        if (dltotal > 0) {
+            p->dl_total = (uint64_t)dltotal;
+        }
+        if (p->handle) {
+            curl_easy_getinfo((CURL *)p->handle, CURLINFO_SPEED_DOWNLOAD, &bps);
+        }
+        p->dl_bps = bps;
+    } else if (p->phase == SP_UPLOAD) {
+        p->ul_now = (uint64_t)ulnow;
+        if (ultotal > 0) {
+            p->ul_total = (uint64_t)ultotal;
+        }
+        if (p->handle) {
+            curl_easy_getinfo((CURL *)p->handle, CURLINFO_SPEED_UPLOAD, &bps);
+        }
+        p->ul_bps = bps;
+    }
+    return p->cancel ? 1 : 0; /* non-zero aborts the transfer */
+}
+
+/* Cloudflare's speed-test sink: __down returns exactly N bytes of filler and
+ * __up swallows a POST body, both over HTTPS with no auth and anycast POPs
+ * worldwide — a stable way to gauge the console's real throughput. The filler
+ * compresses away, so these transfers must NOT advertise gzip (unlike http_get)
+ * or the numbers are meaningless. Own handle per phase (not the shared g_get
+ * one) since they want different options and no size cap. */
+/* Payloads are sized so the transfer runs long enough for TLS/TCP to ramp up
+ * and settle into a steady rate before it ends — a short transfer finishes
+ * during the ramp and reads far too low. On typical Switch Wi-Fi (~10-100 Mbps)
+ * 90 MB down / 40 MB up gives a ~15-30 s measurement. The 120 s per-phase
+ * timeout below keeps the same slow-link floor as before (~7 Mbps still
+ * completes the larger payload in time).
+ *
+ * The download size is capped by Cloudflare: __down?bytes=N returns 403 once N
+ * reaches 100000000 (100 MB), which — with FAILONERROR on — surfaces as a failed
+ * speed test. 90 MB stays clear of that ceiling. The upload has no such limit:
+ * __up swallows a POST body we generate ourselves, so its size is our choice. */
+#define SPEEDTEST_DL_URL   "https://speed.cloudflare.com/__down?bytes=90000000"
+#define SPEEDTEST_UP_URL   "https://speed.cloudflare.com/__up"
+#define SPEEDTEST_UP_BYTES 40000000ULL
+#define SPEEDTEST_TIMEOUT  120L   /* per-phase cap, seconds */
+
+/* Timed download of the fixed payload, reporting progress into *p. */
+static CURLcode speed_run_dl(SpeedProg *p) {
+    CURL *c = curl_easy_init();
+    if (!c) {
+        return CURLE_FAILED_INIT;
+    }
+    p->handle = c;
+    curl_easy_setopt(c, CURLOPT_URL, SPEEDTEST_DL_URL);
+    curl_easy_setopt(c, CURLOPT_FOLLOWLOCATION, 1L);
+    pin_protocols(c);
+    curl_easy_setopt(c, CURLOPT_USERAGENT, USER_AGENT);
+    curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, null_write);
+    curl_easy_setopt(c, CURLOPT_WRITEDATA, NULL);
+    curl_easy_setopt(c, CURLOPT_NOPROGRESS, 0L);
+    curl_easy_setopt(c, CURLOPT_XFERINFOFUNCTION, speed_xfer);
+    curl_easy_setopt(c, CURLOPT_XFERINFODATA, p);
+    curl_easy_setopt(c, CURLOPT_TIMEOUT, SPEEDTEST_TIMEOUT);
+    curl_easy_setopt(c, CURLOPT_CONNECTTIMEOUT, 20L);
+    curl_easy_setopt(c, CURLOPT_FAILONERROR, 1L); /* 4xx/5xx -> error */
+    apply_tls(c);
+
+    CURLcode rc = curl_easy_perform(c);
+    double bps = 0.0;
+    long code = 0;
+    curl_easy_getinfo(c, CURLINFO_SPEED_DOWNLOAD, &bps);
+    curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &code);
+    if (rc == CURLE_OK) {
+        p->dl_bps = bps;
+    }
+    net_log("SPEEDTEST dl -> curl=%d(%s) http=%ld bytes=%llu bps=%.0f",
+            (int)rc, curl_easy_strerror(rc), code,
+            (unsigned long long)p->dl_now, p->dl_bps);
+    p->handle = NULL;
+    curl_easy_cleanup(c);
+    return rc;
+}
+
+/* Timed upload of a fixed filler payload, reporting progress into *p. */
+static CURLcode speed_run_ul(SpeedProg *p) {
+    CURL *c = curl_easy_init();
+    if (!c) {
+        return CURLE_FAILED_INIT;
+    }
+    uint64_t left = SPEEDTEST_UP_BYTES;
+    p->handle = c;
+    p->ul_total = SPEEDTEST_UP_BYTES;
+    curl_easy_setopt(c, CURLOPT_URL, SPEEDTEST_UP_URL);
+    curl_easy_setopt(c, CURLOPT_POST, 1L);
+    curl_easy_setopt(c, CURLOPT_POSTFIELDSIZE_LARGE,
+                     (curl_off_t)SPEEDTEST_UP_BYTES);
+    curl_easy_setopt(c, CURLOPT_READFUNCTION, fill_read);
+    curl_easy_setopt(c, CURLOPT_READDATA, &left);
+    curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, null_write); /* discard reply */
+    curl_easy_setopt(c, CURLOPT_WRITEDATA, NULL);
+    pin_protocols(c);
+    curl_easy_setopt(c, CURLOPT_USERAGENT, USER_AGENT);
+    curl_easy_setopt(c, CURLOPT_NOPROGRESS, 0L);
+    curl_easy_setopt(c, CURLOPT_XFERINFOFUNCTION, speed_xfer);
+    curl_easy_setopt(c, CURLOPT_XFERINFODATA, p);
+    curl_easy_setopt(c, CURLOPT_TIMEOUT, SPEEDTEST_TIMEOUT);
+    curl_easy_setopt(c, CURLOPT_CONNECTTIMEOUT, 20L);
+    curl_easy_setopt(c, CURLOPT_FAILONERROR, 1L); /* 4xx/5xx -> error */
+    apply_tls(c);
+
+    CURLcode rc = curl_easy_perform(c);
+    double bps = 0.0;
+    long code = 0;
+    curl_easy_getinfo(c, CURLINFO_SPEED_UPLOAD, &bps);
+    curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &code);
+    if (rc == CURLE_OK) {
+        p->ul_bps = bps;
+    }
+    net_log("SPEEDTEST ul -> curl=%d(%s) http=%ld bytes=%llu bps=%.0f",
+            (int)rc, curl_easy_strerror(rc), code,
+            (unsigned long long)p->ul_now, p->ul_bps);
+    p->handle = NULL;
+    curl_easy_cleanup(c);
+    return rc;
+}
+
+bool net_speedtest_live(SpeedProg *p) {
+    if (!p) {
+        return false;
+    }
+    p->phase = SP_DOWNLOAD;
+    CURLcode rc = speed_run_dl(p);
+    if (rc != CURLE_OK || p->cancel) {
+        p->phase = SP_DONE;
+        return false;
+    }
+    p->phase = SP_UPLOAD;
+    rc = speed_run_ul(p);
+    p->phase = SP_DONE;
+    if (rc != CURLE_OK || p->cancel) {
+        return false;
+    }
+    return true;
 }
 
 /* Private per-worker connections for parallel GETs (bulk metadata refresh).

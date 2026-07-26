@@ -79,6 +79,11 @@ int main(int argc, char **argv) {
     const char *self = (argc > 0 && argv[0]) ? argv[0] : "";
     MainApplication::SetLaunchPath(self);
 
+    // Relocate any config/log files an older build left directly under
+    // CONFIG_DIR into the new config/ and logs/ subfolders, before anything
+    // (including the update log just below) opens one at its new path.
+    app_migrate_layout();
+
     if (apply_staged_update(self) && envHasNextLoad()) {
         // The old image is already in memory; chainload so this very launch
         // boots the freshly swapped-in build instead of needing another one.

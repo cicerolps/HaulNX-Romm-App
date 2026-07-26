@@ -61,6 +61,11 @@ struct DirEnt {
     std::string name;
     bool is_dir;
     uint64_t size;
+    /* Absolute path this entry points at, when it isn't simply
+     * <listed folder>/<name>. Set for the synthetic Installed-tab rows that
+     * stand in for a console whose install folder is a custom location outside
+     * the ROM root; empty for ordinary directory entries. */
+    std::string path;
 };
 static std::vector<DirEnt> g_inst;
 static std::vector<DirEnt> g_dlfiles; // files in the downloads temp folder
@@ -157,7 +162,10 @@ static void load_console_icons() {
         "channel-f", "arcade", "fbneo",
         // settings-screen card icons (same cache, "set-" prefixed keys)
         "set-updates", "set-ui", "set-advanced", "set-logs", "set-data",
-        "set-credits"};
+        "set-credits",
+        // v2 reorganized settings hierarchy
+        "set-appearance", "set-downloads", "set-sources", "set-storage",
+        "set-transfers", "set-account", "set-diagnostics", "set-logs"};
     for (const char *k : keys) {
         auto tex = pu::ui::render::LoadImageFromFile(std::string("romfs:/icons/") +
                                                      k + ".png");
@@ -1029,7 +1037,7 @@ static std::map<std::string, InstStat> g_inst_stat;
 static bool g_inst_stat_loaded = false;
 static bool g_inst_stat_dirty = false;
 
-#define INST_SIZES_PATH CONFIG_DIR "/inst_sizes.json"
+// INST_SIZES_PATH is defined in config.h alongside the other app paths.
 
 // Persist the folder-size cache across launches. The recursive size walk is the
 // Installed tab's only real load cost; without persistence the whole cache is
@@ -1079,7 +1087,7 @@ static void inst_stat_save(void) {
     if (!g_inst_stat_dirty) {
         return;
     }
-    fs_mkdir_p(CONFIG_DIR);
+    fs_mkdir_p(DATA_DIR);
     FILE *f = fopen(INST_SIZES_PATH, "wb");
     if (!f) {
         return;
@@ -1759,9 +1767,19 @@ void MainApplication::ToastErr(const std::string &msg) {
     this->StartOverlayWithTimeout(t, 1500);
 }
 
-bool MainApplication::Confirm(const std::string &title, const std::string &msg) {
-    // "Cancel" first so it's the default-highlighted (safe) option; B cancels.
-    int r = this->CreateShowDialog(title, msg, {tr(S_CANCEL), tr(S_YES)}, false, {}, style_dialog);
+bool MainApplication::Confirm(const std::string &title, const std::string &msg,
+                              bool yes_default) {
+    // Default-highlight the safe option ("Cancel" first) so a stray A press
+    // doesn't act. Callers where "yes" is the expected answer (e.g. confirming
+    // a cancel the user just asked for) pass yes_default to put "Yes" first.
+    // Either way B dismisses the dialog as "no".
+    if (yes_default) {
+        int r = this->CreateShowDialog(title, msg, {tr(S_YES), tr(S_CANCEL)},
+                                       false, {}, style_dialog);
+        return r == 0;
+    }
+    int r = this->CreateShowDialog(title, msg, {tr(S_CANCEL), tr(S_YES)}, false,
+                                   {}, style_dialog);
     return r == 1;
 }
 
@@ -1869,6 +1887,15 @@ void MainApplication::FilesViewMenu() {
         files_info_line(this->layout.get());
         break;
     }
+}
+
+// Resolved custom install folder for a console, honoring the master switch:
+// with per-console folders turned off, every console falls back to the default
+// <ROM root>/<console>, so the stored paths are ignored (but kept for later).
+// Snapshotted onto each queue item at enqueue, so a mid-flight toggle can't
+// redirect a download already running.
+static const char *install_folder_for(const char *target) {
+    return g_prefs.custom_folders ? config_console_folder(&g_cfg, target) : "";
 }
 
 // A with files marked: queue the whole selection, but total it up first. Every
@@ -2004,7 +2031,8 @@ void MainApplication::QueueSelection() {
         char url[1024];
         ia_file_url(&g_item, f, url, sizeof(url));
         if (!queue_add(url, f->name, g_files_target, auth, f->size,
-                       is_archive_name(f->name), f->md5)) {
+                       is_archive_name(f->name), f->md5,
+                       install_folder_for(g_files_target))) {
             break; // queue filled under us; report what did land
         }
         g_sel.erase(add[i]); // queued items drop out of the selection
@@ -2065,12 +2093,6 @@ void MainApplication::RefreshStatus() {
     }
 }
 
-static bool console_has_pin(const ConsoleGroup *g) {
-    for (int i = 0; i < g->repo_count; i++)
-        if (g->repos[i].pinned) return true;
-    return false;
-}
-
 // Name the import path for the empty Home screen: the welcome dialog is
 // one-shot per launch, and Y is not a discoverable way to be told about it.
 // Built from the menu's own strings so it can't drift from what the menus say —
@@ -2106,7 +2128,7 @@ void MainApplication::GotoHome() {
             }
             char label[160];
             console_label(g_cfg.consoles[i].console, label, sizeof(label));
-            rows.push_back({label, i, console_has_pin(&g_cfg.consoles[i])});
+            rows.push_back({label, i, g_cfg.consoles[i].pinned});
         }
         std::sort(rows.begin(), rows.end(),
                   [](const HomeRow &a, const HomeRow &b) {
@@ -2262,14 +2284,22 @@ MainApplication::Tab MainApplication::CurrentTab() {
     case Screen::Log:
     case Screen::Manage:
     case Screen::Creds:
-    case Screen::Advanced:
-    case Screen::UISettings:
+    case Screen::DlPrefs:
+    case Screen::Appearance:
     case Screen::ExtFilter:
     case Screen::RomPicker:
     case Screen::Downloads:
     case Screen::Language:
     case Screen::Cache:
-    case Screen::ManageData:
+    case Screen::Transfers:
+    case Screen::Sources:
+    case Screen::Storage:
+    case Screen::InstallFolders:
+    case Screen::Account:
+    case Screen::Updates:
+    case Screen::Diagnostics:
+    case Screen::About:
+    case Screen::ExtTuning:
     case Screen::ViewLogs:
     case Screen::DebugLog:
     case Screen::Import:
@@ -2385,6 +2415,19 @@ static int rate_preset_index(int kbps) {
     return idx;
 }
 
+// Cycle the extraction chunk size through the offered sizes (1/2/4 MB). dir>0
+// steps up, dir<0 steps down, both wrapping.
+static int ex_chunk_step(int mb, int dir) {
+    static const int sizes[] = {1, 2, 4};
+    const int n = (int)(sizeof(sizes) / sizeof(sizes[0]));
+    int i = 0;
+    for (int k = 0; k < n; k++) {
+        if (sizes[k] == mb) { i = k; break; }
+    }
+    i = (((i + dir) % n) + n) % n;
+    return sizes[i];
+}
+
 static int rate_step(int kbps, int dir) {
     int i = rate_preset_index(kbps) + dir;
     i = ((i % kRatePresetCount) + kRatePresetCount) % kRatePresetCount; // wrap
@@ -2405,6 +2448,16 @@ static std::string rate_display(int kbps) {
 static void apply_rate_limits(void) {
     queue_set_rate_limits(g_prefs.rate_all_kbps * 1024,
                           g_prefs.rate_item_kbps * 1024);
+}
+
+// Push the extraction-benchmark knobs to the extractor. Called at startup and
+// whenever one of the Advanced toggles changes so the next archive picks them up.
+static void apply_extract_tunables(void) {
+    ExtractTunables t;
+    t.bench = g_prefs.ex_bench;
+    t.prealloc = g_prefs.ex_prealloc;
+    t.chunk_mb = g_prefs.ex_chunk_mb;
+    extract_set_tunables(&t);
 }
 
 // Value column colours (theme-aware).
@@ -2431,58 +2484,63 @@ void MainApplication::GotoSettings() {
     this->layout->SetSubtitle(tr(S_SUB_SETTINGS));
     this->layout->ClearMenu();
     // Row order here is the contract for the A-press switch in OnInput; the
-    // card grid indexes the same way, so both views share it.
+    // card grid indexes the same way, so both views share it. Each row opens a
+    // single-concern sub-screen — no setting lives at this level. Icon slugs are
+    // placeholders until art lands; console_icon() falls back to "default".
     static const struct { int str; const char *icon; } kEntries[] = {
-        {S_CHECK_UPDATES, "set-updates"}, // 0
-        {S_UI_SETTINGS, "set-ui"},        // 1
-        {S_ADVANCED, "set-advanced"},     // 2
-        {S_VIEW_LOGS, "set-logs"},        // 3
-        {S_MANAGE_DATA, "set-data"},      // 4
-        {S_CREDITS, "set-credits"},       // 5
+        {S_SEC_APPEARANCE,  "set-appearance"},  // 0
+        {S_SEC_DOWNLOADS,   "set-downloads"},   // 1
+        {S_SEC_SOURCES,     "set-sources"},     // 2
+        {S_SEC_STORAGE,     "set-storage"},     // 3
+        {S_SEC_TRANSFERS,   "set-transfers"},   // 4
+        {S_SEC_ACCOUNT,     "set-account"},     // 5
+        {S_SEC_UPDATES,     "set-updates"},     // 6 — carries the update chip
+        {S_SEC_LOGS,        "set-logs"},        // 7
+        {S_SEC_DIAGNOSTICS, "set-diagnostics"}, // 8
+        {S_SEC_ABOUT,       "set-credits"},     // 9
     };
+    // The "Update available" / "Restart to update" chip rides the Updates row,
+    // the section that now owns checking and installing.
+    auto has_chip = [&](int str) {
+        return str == S_SEC_UPDATES &&
+               (this->update_available || this->update_installed);
+    };
+    const char *chip = tr(this->update_installed ? S_RESTART_TO_UPDATE
+                                                  : S_UPDATE_AVAIL);
     if (g_prefs.card_view) {
         for (const auto &e : kEntries) {
-            // Row 0 (Check for updates) shows an "Update available" subtitle when
-            // the silent startup check found one; the card renders it as the same
-            // darkening pill used for the download cards' size/speed chip.
-            const char *sub =
-                (e.str == S_CHECK_UPDATES &&
-                 (this->update_available || this->update_installed))
-                    ? tr(this->update_installed ? S_RESTART_TO_UPDATE
-                                                : S_UPDATE_AVAIL)
-                    : "";
-            this->layout->AddCard(tr(e.str), sub, console_icon(e.icon), false);
+            this->layout->AddCard(tr(e.str), has_chip(e.str) ? chip : "",
+                                  console_icon(e.icon), false);
         }
         this->layout->SetCardsMode(true);
     } else {
         pu::ui::Color lbl = g_theme->row_text;
         pu::ui::Color chv = chevron_color();
         for (const auto &e : kEntries) {
-            if (e.str == S_CHECK_UPDATES &&
-                (this->update_available || this->update_installed)) {
+            if (has_chip(e.str)) {
                 // Actionable chip far-right, in the same pill the list's
                 // size/status values use (pill = true), tinted affirmative
                 // green. Once a build is staged it becomes "Restart to update".
-                this->layout->AddRow2(
-                    tr(e.str),
-                    tr(this->update_installed ? S_RESTART_TO_UPDATE
-                                              : S_UPDATE_AVAIL),
-                    lbl, onoff_color(true), -1.0f, nullptr, "", false, true);
+                this->layout->AddRow2(tr(e.str), chip, lbl, onoff_color(true),
+                                      -1.0f, nullptr, "", false, true);
             } else {
                 this->layout->AddRow2(tr(e.str), CHEVRON, lbl, chv, -1.0f,
                                       nullptr, "", false, false);
             }
         }
     }
-    char ri[600];
-    snprintf(ri, sizeof(ri), tr(S_ROM_FOLDER), roms_root(&g_tico));
-    this->layout->SetRomInfo(ri);
+    // The ROM folder lives under Storage now; no longer echoed in the footer.
+    this->layout->SetRomInfo("");
 }
 
-void MainApplication::GotoAdvanced() {
-    this->screen = Screen::Advanced;
-    this->layout->SetTitle(tr(S_TITLE_ADVANCED));
-    this->layout->SetSubtitle(tr(S_SUB_ADVANCED));
+// Downloads: how many run at once, the rate caps, and the two behaviours that
+// belong to a download in flight (skip-installed on a bulk add, keep-awake).
+// Startup checks, credentials and the extraction knobs moved to their own
+// sections — this screen is only about pulling files down.
+void MainApplication::GotoDlPrefs() {
+    this->screen = Screen::DlPrefs;
+    this->layout->SetTitle(tr(S_TITLE_DLPREFS));
+    this->layout->SetSubtitle(tr(S_SUB_DLPREFS));
     this->layout->ClearMenu();
     pu::ui::Color lbl = g_theme->row_text;
     bool b;
@@ -2504,22 +2562,12 @@ void MainApplication::GotoAdvanced() {
                               rate_display(g_prefs.rate_item_kbps), lbl,
                               lim ? value_color() : onoff_color(false)); // 2
     }
-    b = g_prefs.prevent_sleep;
-    this->layout->AddRow2(settings_label(tr(S_STAY_AWAKE)),
-                          b ? tr(S_ON) : tr(S_OFF), lbl, onoff_color(b)); // 3
-    b = g_prefs.net_check;
-    this->layout->AddRow2(settings_label(tr(S_NET_CHECK_STARTUP)),
-                          b ? tr(S_ON) : tr(S_OFF), lbl, onoff_color(b)); // 4
-    b = g_prefs.chk_updates;
-    this->layout->AddRow2(settings_label(tr(S_CHK_UPDATES_STARTUP)),
-                          b ? tr(S_ON) : tr(S_OFF), lbl, onoff_color(b)); // 5
     b = g_prefs.skip_installed;
     this->layout->AddRow2(settings_label(tr(S_SKIP_INSTALLED)),
-                          b ? tr(S_ON) : tr(S_OFF), lbl, onoff_color(b)); // 6
-    b = g_creds.access_key[0] != '\0';
-    this->layout->AddRow2(settings_label(tr(S_ARCHIVE_CREDS)),
-                          b ? tr(S_SET) : tr(S_UNSET), lbl, onoff_color(b)); // 7
-    /* Metadata cache toggle and ROM folder moved to Manage data. */
+                          b ? tr(S_ON) : tr(S_OFF), lbl, onoff_color(b)); // 3
+    b = g_prefs.prevent_sleep;
+    this->layout->AddRow2(settings_label(tr(S_KEEP_AWAKE)),
+                          b ? tr(S_ON) : tr(S_OFF), lbl, onoff_color(b)); // 4
 }
 
 /* Browse the SD card and choose a folder to use as the ROM root. Shows only
@@ -2527,7 +2575,15 @@ void MainApplication::GotoAdvanced() {
 void MainApplication::GotoRomPicker(const std::string &path) {
     this->screen = Screen::RomPicker;
     this->picker_path = path;
-    this->layout->SetTitle(tr(S_TITLE_ROM_PICKER));
+    if (this->picker_console >= 0 &&
+        this->picker_console < g_cfg.console_count) {
+        // Picking a console's custom install folder: name it in the title.
+        this->layout->SetTitle(
+            std::string(g_cfg.consoles[this->picker_console].console) + " > " +
+            tr(S_TITLE_ROM_PICKER));
+    } else {
+        this->layout->SetTitle(tr(S_TITLE_ROM_PICKER));
+    }
     this->layout->SetSubtitle(tr(S_SUB_ROM_PICKER));
     this->layout->ClearMenu();
 
@@ -2552,10 +2608,13 @@ void MainApplication::GotoRomPicker(const std::string &path) {
     this->layout->SetRomInfo(info);
 }
 
-void MainApplication::GotoUISettings() {
-    this->screen = Screen::UISettings;
-    this->layout->SetTitle(tr(S_TITLE_UI_SETTINGS));
-    this->layout->SetSubtitle(tr(S_SUB_UI_SETTINGS));
+// Appearance: what the app looks like and reads as. Theme, card/list layout,
+// grouped-vs-flat Browse, and language. Console visibility and the file-type
+// filter used to live here but are catalogue concerns — they moved to Sources.
+void MainApplication::GotoAppearance() {
+    this->screen = Screen::Appearance;
+    this->layout->SetTitle(tr(S_TITLE_APPEARANCE));
+    this->layout->SetSubtitle(tr(S_SUB_APPEARANCE));
     this->layout->ClearMenu();
     pu::ui::Color lbl = g_theme->row_text;
     bool b = g_prefs.card_view;
@@ -2564,17 +2623,12 @@ void MainApplication::GotoUISettings() {
     this->layout->AddRow2(settings_label(tr(S_THEME)),
                           is_light_theme() ? tr(S_THEME_LIGHT) : tr(S_THEME_DARK),
                           lbl, value_color());                                 // 1
-    const char *cur = g_prefs.lang[0] ? g_prefs.lang : "en";
-    this->layout->AddRow2(settings_label(tr(S_LANGUAGE)), lang_display_name(cur),
-                          lbl, value_color());                                 // 2
     b = g_prefs.group_consoles;
     this->layout->AddRow2(settings_label(tr(S_GROUP_CONSOLES)),
-                          b ? tr(S_ON) : tr(S_OFF), lbl, onoff_color(b)); // 3
-    this->layout->AddRow2(tr(S_MANAGE_CONSOLES), CHEVRON, lbl, chevron_color(),
-                          -1.0f, nullptr, "", false, false);       // 4
-    b = g_prefs.filter_exts;
-    this->layout->AddRow2(settings_label(tr(S_FILTER_EXTS)),
-                          b ? tr(S_ON) : tr(S_OFF), lbl, onoff_color(b)); // 5
+                          b ? tr(S_ON) : tr(S_OFF), lbl, onoff_color(b)); // 2
+    const char *cur = g_prefs.lang[0] ? g_prefs.lang : "en";
+    this->layout->AddRow2(settings_label(tr(S_LANGUAGE)), lang_display_name(cur),
+                          lbl, value_color());                                 // 3
 }
 
 // Browse file-view extension filter editor: a master ON/OFF switch, one
@@ -2675,28 +2729,511 @@ void MainApplication::GotoCache() {
     }
 }
 
-void MainApplication::GotoManageData() {
-    this->screen = Screen::ManageData;
-    this->layout->SetTitle(tr(S_TITLE_MANAGE_DATA));
-    this->layout->SetSubtitle(tr(S_SUB_MANAGE_DATA));
+// Collection Management: the Wi-Fi hub for moving a collection between this
+// console and a PC on the same LAN (import / export / restore). Pushing an
+// .nro build over Wi-Fi is an app update, so it lives under Updates now;
+// Storage/ROM-folder concerns live under Storage.
+void MainApplication::GotoTransfers() {
+    this->screen = Screen::Transfers;
+    this->layout->SetTitle(tr(S_TITLE_TRANSFERS));
+    this->layout->SetSubtitle(tr(S_SUB_TRANSFERS));
+    this->layout->ClearMenu();
+    this->layout->AddRow(tr(S_IMPORT_COLLECTION));  // 0 receive dl_sources.json from a PC
+    this->layout->AddRow(tr(S_EXPORT_COLLECTION));  // 1 serve dl_sources.json to a PC
+    this->layout->AddRow(tr(S_RESTORE_COLLECTION)); // 2 restore previous collection
+}
+
+// Sources: the catalogue you pull from. Which consoles show on Browse, the
+// repos under them, and the file-type filter that hides junk in a repo's file
+// list. Split out of Appearance because curating what you download is a
+// different job from choosing how the app looks.
+void MainApplication::GotoSources() {
+    this->screen = Screen::Sources;
+    this->layout->SetTitle(tr(S_TITLE_SOURCES));
+    this->layout->SetSubtitle(tr(S_SUB_SOURCES));
     this->layout->ClearMenu();
     pu::ui::Color lbl = g_theme->row_text;
-    this->layout->AddRow(tr(S_IMPORT_COLLECTION));  // 0 receive dl_sources.json from a PC
-    this->layout->AddRow(tr(S_RESTORE_COLLECTION)); // 1 restore previous collection
-    {                                               // 2 ROM folder (moved from Advanced)
+    this->layout->AddRow2(tr(S_MANAGE_CONSOLES), CHEVRON, lbl, chevron_color(),
+                          -1.0f, nullptr, "", false, false);       // 0
+    bool b = g_prefs.filter_exts;
+    this->layout->AddRow2(settings_label(tr(S_FILTER_EXTS)),
+                          b ? tr(S_ON) : tr(S_OFF), lbl, onoff_color(b)); // 1
+}
+
+// Storage: where space goes and how to reclaim it. A live SD-card readout, the
+// ROM install folder, the download scratch area, and the metadata cache. The
+// SD row is a status line (A opens a used/free breakdown); the rest drill in.
+void MainApplication::GotoStorage() {
+    this->screen = Screen::Storage;
+    this->layout->SetTitle(tr(S_TITLE_STORAGE));
+    this->layout->SetSubtitle(tr(S_SUB_STORAGE));
+    this->layout->ClearMenu();
+    pu::ui::Color lbl = g_theme->row_text;
+    {                                               // 0 SD free space (status)
+        uint64_t fb = fs_free_bytes("sdmc:/");
+        uint64_t tb = fs_total_bytes("sdmc:/");
+        char v[64];
+        if (fb == UINT64_MAX || tb == UINT64_MAX) {
+            snprintf(v, sizeof(v), "?");
+        } else {
+            snprintf(v, sizeof(v), tr(S_SD_FREE_OF), human_size(fb).c_str(),
+                     human_size(tb).c_str());
+        }
+        this->layout->AddRow2(settings_label(tr(S_SD_CARD)), v, lbl,
+                              value_color());
+    }
+    {                                               // 1 ROM folder
         bool custom = g_prefs.roms_override[0] != '\0';
         this->layout->AddRow2(settings_label(tr(S_ROMS_OVERRIDE)),
                               custom ? roms_root(&g_tico) : tr(S_ROMS_AUTO), lbl,
                               custom ? value_color() : onoff_color(false));
     }
-    this->layout->AddRow(tr(S_MANAGE_DOWNLOADS));   // 3 manage downloads folder
-    this->layout->AddRow(tr(S_MANAGE_CACHE));       // 4 manage metadata cache
-    {                                               // 5 metadata cache on/off (moved from Advanced)
+    {                                               // 2 install-folder mode
+        bool cf = g_prefs.custom_folders;
+        this->layout->AddRow2(settings_label(tr(S_INSTALL_MODE)),
+                              cf ? tr(S_INSTALL_MODE_CUSTOM)
+                                 : tr(S_INSTALL_MODE_DEFAULT),
+                              lbl, onoff_color(cf));
+    }
+    {                                               // 3 per-console folders
+        // Only actionable when custom mode is on; otherwise it reads as a locked
+        // hint so the "unlock" relationship with the row above is visible.
+        bool cf = g_prefs.custom_folders;
+        this->layout->AddRow2(settings_label(tr(S_CONSOLE_FOLDERS)),
+                              cf ? tr(S_OPEN) : tr(S_LOCKED), lbl,
+                              cf ? value_color() : onoff_color(false));
+    }
+    this->layout->AddRow(tr(S_MANAGE_DOWNLOADS));   // 4 download scratch folder
+    {                                               // 5 metadata cache on/off
         bool b = g_prefs.use_cache;
         this->layout->AddRow2(settings_label(tr(S_META_CACHE)),
                               b ? tr(S_ON) : tr(S_OFF), lbl, onoff_color(b));
     }
-    this->layout->AddRow(tr(S_REFRESH_ALL));        // 6 refresh all metadata
+    this->layout->AddRow(tr(S_MANAGE_META));        // 6 browse/clear the cache
+    this->layout->AddRow(tr(S_REFRESH_ALL));        // 7 refetch every repo's list
+}
+
+// Storage sub-screen: the list of consoles, each showing its install folder
+// (default or a custom path). A opens the SD folder picker for that console.
+// Only reachable when the per-console mode is on (see GotoStorage row 2).
+void MainApplication::GotoInstallFolders() {
+    this->screen = Screen::InstallFolders;
+    this->layout->SetTitle(tr(S_TITLE_CONSOLE_FOLDERS));
+    this->layout->SetSubtitle(tr(S_SUB_CONSOLE_FOLDERS));
+    this->layout->ClearMenu();
+    for (int i = 0; i < g_cfg.console_count; i++) {
+        ConsoleGroup *g = &g_cfg.consoles[i];
+        char label[128];
+        console_label(g->console, label, sizeof(label));
+        this->layout->AddRow2(label,
+                              g->folder[0] ? g->folder
+                                           : tr(S_INSTALL_FOLDER_DEFAULT),
+                              g_theme->row_text, onoff_color(g->folder[0] != 0),
+                              -1.0f, console_icon(g->console));
+    }
+    if (g_cfg.console_count == 0) {
+        this->layout->AddRow(tr(S_NO_CONSOLES));
+    }
+}
+
+// Sum the sizes of the files directly in a folder (non-recursive, files only).
+// The download scratch and metadata cache are both flat, so this is enough to
+// report what the app itself is holding without walking the whole card.
+static uint64_t dir_total_size(const char *path) {
+    uint64_t total = 0;
+    for (const auto &e : list_dir(path)) {
+        if (!e.is_dir) total += e.size;
+    }
+    return total;
+}
+
+// A on the SD-card status row: a breakdown of what the app itself is holding
+// (download scratch + metadata cache) against the card's free/total.
+void MainApplication::StorageDetail() {
+    uint64_t fb = fs_free_bytes("sdmc:/");
+    uint64_t tb = fs_total_bytes("sdmc:/");
+    uint64_t dl = dir_total_size(DL_TMP_DIR);
+    uint64_t ca = dir_total_size(CACHE_DIR);
+    char body[320];
+    snprintf(body, sizeof(body), tr(S_STORAGE_DETAIL),
+             (fb == UINT64_MAX) ? "?" : human_size(fb).c_str(),
+             (tb == UINT64_MAX) ? "?" : human_size(tb).c_str(),
+             human_size(dl).c_str(), human_size(ca).c_str());
+    this->CreateShowDialog(tr(S_STORAGE_TITLE), body, {tr(S_OK)}, true, {},
+                           style_dialog);
+}
+
+// Account & Network: the two things that reach off-device. archive.org S3
+// credentials (only ever sent to archive.org over HTTPS) and whether to warn
+// at startup when there's no connection.
+void MainApplication::GotoAccount() {
+    this->screen = Screen::Account;
+    this->layout->SetTitle(tr(S_TITLE_ACCOUNT));
+    this->layout->SetSubtitle(tr(S_SUB_ACCOUNT));
+    this->layout->ClearMenu();
+    pu::ui::Color lbl = g_theme->row_text;
+    bool b = g_creds.access_key[0] != '\0';
+    this->layout->AddRow2(settings_label(tr(S_ARCHIVE_CREDS)),
+                          b ? tr(S_SET) : tr(S_UNSET), lbl, onoff_color(b)); // 0
+    b = g_prefs.net_check;
+    this->layout->AddRow2(settings_label(tr(S_NET_CHECK_STARTUP)),
+                          b ? tr(S_ON) : tr(S_OFF), lbl, onoff_color(b)); // 1
+}
+
+// Updates: check now (GitHub release or a pushed .nro over Wi-Fi) and whether
+// to check silently at startup. The top-level Updates row carries the
+// "Update available" chip; this is where you act on it.
+void MainApplication::GotoUpdates() {
+    this->screen = Screen::Updates;
+    this->layout->SetTitle(tr(S_TITLE_UPDATES));
+    this->layout->SetSubtitle(tr(S_SUB_UPDATES));
+    this->layout->ClearMenu();
+    pu::ui::Color lbl = g_theme->row_text;
+    if (this->update_available || this->update_installed) {
+        this->layout->AddRow2(
+            tr(S_CHECK_NOW),
+            tr(this->update_installed ? S_RESTART_TO_UPDATE : S_UPDATE_AVAIL),
+            lbl, onoff_color(true), -1.0f, nullptr, "", false, true); // 0
+    } else {
+        this->layout->AddRow(tr(S_CHECK_NOW));                        // 0
+    }
+    // Receive a pushed .nro build over Wi-Fi (moved here from Collection
+    // Management — it's an app update, not a collection transfer).
+    this->layout->AddRow2(tr(S_UPDATE_OVER_WIFI), CHEVRON, lbl, chevron_color(),
+                          -1.0f, nullptr, "", false, false);         // 1
+    bool b = g_prefs.chk_updates;
+    this->layout->AddRow2(settings_label(tr(S_CHK_UPDATES_STARTUP)),
+                          b ? tr(S_ON) : tr(S_OFF), lbl, onoff_color(b)); // 2
+}
+
+// Diagnostics: a log bundle export, a network self-test, a speed test, the
+// extraction perf knobs (dev-only, no longer masquerading as a user setting),
+// and a factory reset. Logs themselves are a top-level Settings section now.
+// Nothing here changes day-to-day behaviour.
+void MainApplication::GotoDiagnostics() {
+    this->screen = Screen::Diagnostics;
+    this->layout->SetTitle(tr(S_TITLE_DIAGNOSTICS));
+    this->layout->SetSubtitle(tr(S_SUB_DIAGNOSTICS));
+    this->layout->ClearMenu();
+    this->layout->AddRow(tr(S_EXPORT_BUNDLE));  // 0 concat logs to one file
+    this->layout->AddRow(tr(S_NET_SELFTEST));   // 1 LAN + archive.org check
+    this->layout->AddRow(tr(S_SPEEDTEST));      // 2 download throughput test
+    this->layout->AddRow(tr(S_EXT_TUNING));     // 3 extraction perf knobs (dev)
+    this->layout->AddRow(tr(S_RESET_DEFAULTS)); // 4 restore default settings
+}
+
+// Diagnostics -> Extraction tuning: the three dev/perf knobs. Flip one, extract
+// an archive, read the per-archive throughput back from exbench.log, compare.
+void MainApplication::GotoExtTuning() {
+    this->screen = Screen::ExtTuning;
+    this->layout->SetTitle(tr(S_TITLE_EXT_TUNING));
+    this->layout->SetSubtitle(tr(S_SUB_EXT_TUNING));
+    this->layout->ClearMenu();
+    pu::ui::Color lbl = g_theme->row_text;
+    bool b = g_prefs.ex_bench;
+    this->layout->AddRow2(settings_label(tr(S_EX_BENCH)),
+                          b ? tr(S_ON) : tr(S_OFF), lbl, onoff_color(b)); // 0
+    b = g_prefs.ex_prealloc;
+    this->layout->AddRow2(settings_label(tr(S_EX_PREALLOC)),
+                          b ? tr(S_ON) : tr(S_OFF), lbl, onoff_color(b)); // 1
+    {
+        char v[16];
+        snprintf(v, sizeof(v), "%d MB", g_prefs.ex_chunk_mb);
+        this->layout->AddRow2(settings_label(tr(S_EX_CHUNK)), v, lbl,
+                              value_color());                            // 2
+    }
+}
+
+// About: version (in the title), a re-runnable "Getting started" walk-through
+// for new users, the release-notes history, and credits.
+void MainApplication::GotoAbout() {
+    this->screen = Screen::About;
+    this->layout->SetTitle(std::string(tr(S_TITLE_ABOUT)) + "   (v" +
+                           APP_VERSION_STR + ")");
+    this->layout->SetSubtitle(tr(S_SUB_ABOUT));
+    this->layout->ClearMenu();
+    this->layout->AddRow(tr(S_GETTING_STARTED)); // 0 re-run onboarding
+    this->layout->AddRow(tr(S_RELEASE_NOTES));   // 1 GitHub release history
+    this->layout->AddRow(tr(S_CREDITS));         // 2 credits dialog
+}
+
+// Re-runnable onboarding: the same two-way "get a collection onto the console"
+// prompt a first-run user sees, reachable any time from About.
+void MainApplication::GettingStarted() {
+    this->Welcome();
+}
+
+// Append one log file into the open bundle, with a header, if it exists. Skips
+// silently when the file is absent (a log that never got written is not an
+// error worth surfacing in the bundle).
+static void bundle_append(FILE *out, const char *label, const char *path) {
+    FILE *in = fopen(path, "rb");
+    fprintf(out, "==== %s (%s) ====\n", label, path);
+    if (!in) {
+        fprintf(out, "(not present)\n\n");
+        return;
+    }
+    char buf[4096];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof(buf), in)) > 0) {
+        fwrite(buf, 1, n, out);
+    }
+    fprintf(out, "\n\n");
+    fclose(in);
+}
+
+#define DIAG_BUNDLE_PATH CONFIG_DIR "/diag_bundle.txt"
+
+// Diagnostics -> Export debug bundle: fold every log the app keeps into one
+// file the user can pull off with the export flow (or the SD card) and attach
+// to a bug report, instead of hunting five separate logs.
+void MainApplication::ExportBundle() {
+    fs_mkdir_p(CONFIG_DIR);
+    FILE *out = fopen(DIAG_BUNDLE_PATH, "wb");
+    if (!out) {
+        this->ToastErr(tr(S_BUNDLE_FAIL));
+        return;
+    }
+    fprintf(out, "HaulNX v%s debug bundle\n\n", APP_VERSION_STR);
+    bundle_append(out, "debug", LOG_PATH);
+    bundle_append(out, "transfers", XFERLOG_PATH);
+    bundle_append(out, "speedtest", SPEEDLOG_PATH);
+    bundle_append(out, "downloads", DLLOG_PATH);
+    bundle_append(out, "extract-bench", EXBENCH_PATH);
+    bundle_append(out, "queue-state", QUEUE_STATE_PATH);
+    bool ok = (fclose(out) == 0);
+    if (!ok) {
+        this->ToastErr(tr(S_BUNDLE_FAIL));
+        return;
+    }
+    char t[128];
+    snprintf(t, sizeof(t), tr(S_BUNDLE_DONE), DIAG_BUNDLE_PATH);
+    this->Toast(t);
+}
+
+// Worker for the network self-test: does the LAN check (instant) and a single
+// small GET to archive.org (which can block on a dead link, hence off-thread).
+void MainApplication::DiagThread(void *arg) {
+    auto self = static_cast<MainApplication *>(arg);
+    self->diag_lan = httpsrv_local_ip(self->diag_ip, sizeof(self->diag_ip));
+    self->diag_net = false;
+    if (self->diag_lan) {
+        long code = 0;
+        char *body = http_get("https://archive.org/robots.txt", &code, NULL);
+        self->diag_net = (body != NULL && code >= 200 && code < 400);
+        free(body);
+    }
+    self->diag.done = true;
+}
+
+// Diagnostics -> Network self-test: kick the worker and show a spinner. The
+// screen stays put; DiagTick reaps the result and shows it in a dialog.
+void MainApplication::NetSelfTest() {
+    this->diag_speed = false;
+    this->diag_lan = false;
+    this->diag_net = false;
+    this->diag_ip[0] = '\0';
+    if (!this->diag.Start(&MainApplication::DiagThread, this)) {
+        this->ToastErr(tr(S_SELFTEST_NET_FAIL));
+        return;
+    }
+    this->layout->ClearMenu();
+    this->layout->ShowSpinner(tr(S_SELFTEST_RUNNING));
+}
+
+// One timestamped line per speed-test run in its own log (see SPEEDLOG_PATH):
+// date, per-direction bytes transferred and rate, and the outcome. Mirrors
+// xfer_log — small and infrequent, so the rotate check runs every call.
+static void speed_log(const char *fmt, ...) {
+    fs_log_rotate(SPEEDLOG_PATH, LOG_ROTATE_XFER);
+    fs_mkdir_p(LOGS_DIR);
+    FILE *f = fopen(SPEEDLOG_PATH, "a");
+    if (!f) {
+        return;
+    }
+    char ts[32] = "";
+    time_t t = time(NULL);
+    struct tm tmv;
+    struct tm *tm = localtime_r(&t, &tmv);
+    if (tm) {
+        strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M", tm);
+    }
+    fprintf(f, "%s  ", ts);
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(f, fmt, ap);
+    va_end(ap);
+    fputc('\n', f);
+    fclose(f);
+}
+
+// Worker for the speed test: a timed HTTPS download then a timed upload of a
+// fixed payload, both discarded — throughput only. Blocks, so it lives off the
+// UI thread. sp_prog carries the live byte/rate counters the UI reads.
+void MainApplication::SpeedThread(void *arg) {
+    auto self = static_cast<MainApplication *>(arg);
+    bool ok = net_speedtest_live(&self->sp_prog);
+    const SpeedProg &p = self->sp_prog;
+    // bytes/sec -> megabits/sec for the result dialog.
+    self->diag_mbps = p.dl_bps * 8.0 / 1000000.0;
+    self->diag_ul_mbps = p.ul_bps * 8.0 / 1000000.0;
+    self->diag_sp_cancelled = p.cancel != 0;
+    self->diag_sp_ok = ok;
+    // Record the run (including failures/cancels) so the Logs section keeps a
+    // history of throughput readings with the data actually transferred.
+    const char *outcome = ok ? "ok" : (p.cancel ? "cancelled" : "failed");
+    speed_log("DL %s @ %.1f Mbps   UL %s @ %.1f Mbps   [%s, Cloudflare]",
+              human_size(p.dl_now).c_str(), p.dl_bps * 8.0 / 1000000.0,
+              human_size(p.ul_now).c_str(), p.ul_bps * 8.0 / 1000000.0,
+              outcome);
+    self->diag.done = true;
+}
+
+// Diagnostics -> Speed test: kick the worker and open the live meter screen.
+// Shares the diag BgTask + DiagTick reaper with the self-test; diag_speed tags
+// the mode. Unlike the self-test, this one shows live progress and B cancels.
+void MainApplication::SpeedTest() {
+    this->diag_speed = true;
+    this->diag_sp_ok = false;
+    this->diag_sp_cancelled = false;
+    this->diag_mbps = 0.0;
+    this->diag_ul_mbps = 0.0;
+    memset(&this->sp_prog, 0, sizeof(this->sp_prog)); // reset counters + cancel
+    if (!this->diag.Start(&MainApplication::SpeedThread, this)) {
+        this->ToastErr(tr(S_SPEEDTEST_FAIL));
+        return;
+    }
+    this->screen = Screen::SpeedTest;
+    this->layout->SetTitle(tr(S_SPEEDTEST));
+    this->layout->SetSubtitle(tr(S_SPEEDTEST_SUB));
+    this->layout->ClearMenu();
+    this->SpeedRender(); // draw the initial (zeroed) meters
+}
+
+// Redraw the download/upload meters while the test runs. Rebuilds the two rows
+// every tick like the Queue live view, throttled to ~10 Hz so the volatile
+// rate text doesn't re-rasterize every frame.
+void MainApplication::SpeedRender() {
+    static u64 last = 0;
+    u64 now = armGetSystemTick();
+    if (last != 0 && armTicksToNs(now - last) < 100000000ULL) {
+        return;
+    }
+    last = now;
+
+    const SpeedProg &p = this->sp_prog;
+    // One row: a phase label on the left, its live rate (+ ETA) on the right,
+    // and a progress bar underneath. Green + accent while it's the live phase,
+    // a full green bar once it's finished, dim "--" before it starts.
+    auto meter = [&](int phase, const char *label, uint64_t nowb, uint64_t total,
+                     double bps) {
+        bool active = (p.phase == phase);
+        bool done = (p.phase > phase);
+        float prog = (total > 0) ? (float)((double)nowb / (double)total) : -1.0f;
+        if (prog > 1.0f) prog = 1.0f;
+        char right[64];
+        double mbps = bps * 8.0 / 1000000.0;
+        if (active || done) {
+            if (!done && total > nowb && bps > 0.0) {
+                uint64_t eta = (uint64_t)((double)(total - nowb) / bps);
+                snprintf(right, sizeof(right), "%.1f Mbps  ~%s", mbps,
+                         human_eta(eta).c_str());
+            } else {
+                snprintf(right, sizeof(right), "%.1f Mbps", mbps);
+            }
+        } else {
+            snprintf(right, sizeof(right), "--");
+        }
+        pu::ui::Color lc = g_theme->row_text;
+        pu::ui::Color rc = active ? accent_green() : value_color();
+        int bar = 0;
+        if (done) {
+            prog = 1.0f;
+            bar = 1; // solid green bar, matching a completed queue item
+        }
+        this->layout->AddRow2(label, right, lc, rc, prog, nullptr, "", active,
+                              false, false, bar);
+    };
+
+    this->layout->ClearMenu(false); // rebuilt every tick: no enter fade
+    meter(SP_DOWNLOAD, tr(S_SPEEDTEST_DOWNLOAD), p.dl_now, p.dl_total, p.dl_bps);
+    meter(SP_UPLOAD, tr(S_SPEEDTEST_UPLOAD), p.ul_now, p.ul_total, p.ul_bps);
+    this->layout->SetRomInfo(tr(S_SPEEDTEST_CANCEL_HINT));
+}
+
+void MainApplication::DiagTick() {
+    // Speed test: keep the live meters ticking until the worker finishes.
+    if (this->diag_speed && !this->diag.done) {
+        this->SpeedRender();
+        return;
+    }
+    if (!this->diag.done) {
+        return;
+    }
+    this->diag.Join();
+    if (this->diag_speed) {
+        this->diag_speed = false;
+        // Cancelled mid-transfer: just drop back to Diagnostics, no dialog.
+        if (this->diag_sp_cancelled) {
+            this->GotoDiagnostics();
+            this->layout->SetSel(2); // land back on the Speed test row
+            return;
+        }
+        char body[192];
+        if (this->diag_sp_ok) {
+            snprintf(body, sizeof(body), tr(S_SPEEDTEST_RESULT),
+                     this->diag_mbps, this->diag_ul_mbps);
+        } else {
+            snprintf(body, sizeof(body), "%s", tr(S_SPEEDTEST_FAIL));
+        }
+        this->CreateShowDialog(tr(S_SPEEDTEST), body, {tr(S_OK)}, true, {},
+                               style_dialog);
+        this->GotoDiagnostics();
+        this->layout->SetSel(2);
+        return;
+    }
+    char lan_line[96];
+    if (this->diag_lan) {
+        snprintf(lan_line, sizeof(lan_line), tr(S_SELFTEST_LAN_OK),
+                 this->diag_ip);
+    } else {
+        snprintf(lan_line, sizeof(lan_line), "%s", tr(S_SELFTEST_LAN_FAIL));
+    }
+    const char *net_line =
+        this->diag_net ? tr(S_SELFTEST_NET_OK) : tr(S_SELFTEST_NET_FAIL);
+    char body[256];
+    snprintf(body, sizeof(body), tr(S_SELFTEST_RESULT), lan_line, net_line);
+    this->CreateShowDialog(tr(S_NET_SELFTEST), body, {tr(S_OK)}, true, {},
+                           style_dialog);
+    this->GotoDiagnostics();
+}
+
+// Diagnostics -> Reset settings to defaults: wipe prefs.json and reload the
+// built-in defaults, then re-apply the runtime state that tracks a pref
+// (queue slots, rate caps, theme, language, extraction knobs, ROM root).
+// Collections, downloads and credentials are on their own files and untouched.
+void MainApplication::ResetDefaults() {
+    if (!this->ConfirmDanger(tr(S_RESET_DEFAULTS),
+                             tr(S_RESET_DEFAULTS_CONFIRM))) {
+        return;
+    }
+    remove(PREFS_PATH);
+    prefs_load(&g_prefs);   // reproduces the first-run default state
+    prefs_save(&g_prefs);
+    // Push the reloaded defaults into everything that caches a pref.
+    queue_set_max_dl(g_prefs.max_downloads);
+    apply_rate_limits();
+    apply_extract_tunables();
+    select_theme();
+    this->layout->ApplyTheme();
+    i18n_load(NULL);        // lang reset to English
+    this->layout->RefreshTabs();
+    this->SyncTab();
+    tico_init(&g_tico);
+    tico_set_roms_override(&g_tico, g_prefs.roms_override);
+    this->inst_path = roms_root(&g_tico);
+    this->Toast(tr(S_RESET_DONE));
+    this->GotoDiagnostics();
 }
 
 // Append a timestamped line to the collection-transfer log. An import replaces
@@ -2705,7 +3242,7 @@ void MainApplication::GotoManageData() {
 static void xfer_log(const char *fmt, ...) {
     // A handful of lines per transfer, so the size check can run every time.
     fs_log_rotate(XFERLOG_PATH, LOG_ROTATE_XFER);
-    fs_mkdir_p(CONFIG_DIR);
+    fs_mkdir_p(LOGS_DIR);
     FILE *f = fopen(XFERLOG_PATH, "a");
     if (!f) {
         return;
@@ -2768,6 +3305,43 @@ void MainApplication::ImportStart(bool onboarding) {
                                 tr(S_IMPORT_REPO_NOTE));
 }
 
+// ---- export this console's collection to a PC on the same LAN -------------
+// The mirror of ImportStart: same receiver, opened in export mode so the browser
+// (or the app utility's Export tab) can pull the running dl_sources.json back to
+// a computer to edit. Nothing is received here — the screen just serves the
+// export until the user backs out, so it reuses the whole Import machinery
+// (poll/tick/stop/return) with only the mode, title and steps changed.
+void MainApplication::ExportStart() {
+    char ip[64];
+    if (!httpsrv_local_ip(ip, sizeof(ip))) {
+        this->ToastErr(tr(S_IMPORT_NO_NET));
+        return;
+    }
+    if (!httpsrv_open(&this->imp_srv)) {
+        this->ToastErr(tr(S_IMPORT_SRV_FAIL));
+        return;
+    }
+    this->imp_srv.mode = HTTPSRV_MODE_EXPORT; // serve the export, refuse uploads
+    this->imp_open = true;
+    this->imp_grace = 0;
+    this->imp_onboard = false;
+    this->imp_nro = false; // returns to Manage data, like an import
+    this->imp_prog = false;
+    this->screen = Screen::Import;
+
+    char url[96];
+    snprintf(url, sizeof(url), "http://%s:%d/%s", ip, HTTPSRV_PORT,
+             this->imp_srv.token);
+
+    xfer_log("listening  %s (export)", url);
+
+    this->layout->SetTitle(tr(S_TITLE_EXPORT));
+    this->layout->SetSubtitle(tr(S_SUB_EXPORT));
+    this->layout->ClearMenu();
+    this->layout->SetEmptyState(g_header_logo, url, tr(S_EXPORT_STEPS), true,
+                                tr(S_IMPORT_REPO_NOTE));
+}
+
 // The Wi-Fi half of Settings > Check for updates: the exact Import receiver,
 // dressed for an app build — the served page and the on-screen steps talk
 // about the .nro, and the flow returns to Settings instead of Manage data.
@@ -2783,7 +3357,7 @@ void MainApplication::UpdateWifiStart() {
         this->ToastErr(tr(S_IMPORT_SRV_FAIL));
         return;
     }
-    this->imp_srv.nro_page = true; // browser gets the update page, not import
+    this->imp_srv.mode = HTTPSRV_MODE_NRO; // browser gets the update page
     this->imp_open = true;
     this->imp_grace = 0;
     this->imp_onboard = false;
@@ -2816,9 +3390,9 @@ void MainApplication::ImportReturn() {
     if (onboard) {
         this->GotoHome();
     } else if (nro) {
-        this->GotoSettings(); // update-over-Wi-Fi came from Settings
+        this->GotoUpdates(); // update-over-Wi-Fi lives under Updates now
     } else {
-        this->GotoManageData();
+        this->GotoTransfers();
     }
 }
 
@@ -2981,7 +3555,13 @@ void MainApplication::NroApply(char *body, size_t len) {
     char msg[512];
     snprintf(msg, sizeof(msg), tr(S_NRO_CONFIRM), ver, human_size(len).c_str(),
              APP_VERSION_STR);
-    if (!this->ConfirmDanger(tr(S_TITLE_UPDATE), msg)) {
+    // Yes is the default here: the user just sent this build over to install
+    // it, so the expected answer is "install". The red title still flags that
+    // it replaces the running app; B (or Cancel) dismisses as "no".
+    int cr = this->CreateShowDialog(tr(S_TITLE_UPDATE), msg,
+                                    {tr(S_YES), tr(S_CANCEL)}, false, {},
+                                    style_dialog_danger);
+    if (cr != 0) {
         xfer_log("cancelled  app build v%s not installed", ver);
         free(body);
         this->ImportReturn();
@@ -3138,7 +3718,7 @@ void MainApplication::RestoreBackup() {
     char done[96];
     snprintf(done, sizeof(done), tr(S_RESTORE_DONE), consoles, repos);
     this->Toast(done);
-    this->GotoManageData();
+    this->GotoTransfers();
 }
 
 // ---- bulk metadata refresh (Manage data -> Refresh all metadata) ----------
@@ -3261,7 +3841,7 @@ void MainApplication::RaTick() {
     } else {
         this->Toast(t);
     }
-    this->GotoManageData();
+    this->GotoStorage(); // refresh-all is reached from Storage now
 }
 
 void MainApplication::GotoViewLogs() {
@@ -3273,7 +3853,8 @@ void MainApplication::GotoViewLogs() {
     this->layout->AddRow(tr(S_DEBUG_LOG));     // 1: debug.log
     this->layout->AddRow(tr(S_QUEUE_STATE));   // 2: persisted queue.json
     this->layout->AddRow(tr(S_XFER_LOG));      // 3: transfers.log
-    this->layout->AddRow(tr(S_RELEASE_NOTES)); // 4: GitHub release history
+    this->layout->AddRow(tr(S_SPEEDTEST_LOG)); // 4: speedtest.log
+    this->layout->AddRow(tr(S_RELEASE_NOTES)); // 5: GitHub release history
 }
 
 // Rows truncate long log lines; pressing A shows the full text in a dialog.
@@ -3464,6 +4045,25 @@ static void run_search_scan(const std::string &query, int scope_ci,
             if (!rp->enabled || !rp->id[0]) continue;
             repos.push_back({rp->id, g_cfg.consoles[c].target,
                              rp->download_base});
+        }
+    }
+
+    // For a scoped search (a whole console, or one repo within it) make sure
+    // every in-scope repo's metadata is actually on the card before we walk the
+    // cache. Otherwise searching a console straight from its repo list — before
+    // you've opened any of its repos — finds nothing, because the on-disk cache
+    // is only populated when a repo is browsed. Cache-first, so this is instant
+    // for repos you've already opened and only hits the network for the gaps;
+    // the "Searching…" spinner is already showing and B still cancels between
+    // fetches. Global search (scope_ci < 0) would mean fetching every repo you
+    // own, so it keeps scanning whatever is already cached.
+    if (scope_ci >= 0) {
+        for (const auto &rr : repos) {
+            if (g_search_cancel) return;
+            ArchiveItem tmp;
+            if (ia_fetch(rr.id.c_str(), &tmp, true, CACHE_DIR)) {
+                ia_free(&tmp);
+            }
         }
     }
 
@@ -3688,12 +4288,49 @@ void MainApplication::GotoLanguage() {
 
 // Colour of the Shown/Hidden state label on the Manage consoles rows. Shared
 // by the initial build and the in-place toggle so the two never drift.
-static pu::ui::Color manage_state_color(bool shown) {
-    if (shown) {
-        return accent_green();
+// Per-console visibility spans the two tabs it can appear on. It is stored as
+// two independent bools (shown = Browse, shown_installed = Installed); a single
+// A-press on the Manage screen cycles through the four combinations. Kept as one
+// control so both tabs are managed in one place.
+enum {
+    VIS_BOTH = 0,      // Browse + Installed
+    VIS_BROWSE = 1,    // Browse only
+    VIS_INSTALLED = 2, // Installed only
+    VIS_HIDDEN = 3     // neither
+};
+
+static int console_vis_state(const ConsoleGroup &g) {
+    if (g.shown && g.shown_installed) return VIS_BOTH;
+    if (g.shown) return VIS_BROWSE;
+    if (g.shown_installed) return VIS_INSTALLED;
+    return VIS_HIDDEN;
+}
+
+static void console_vis_apply(ConsoleGroup &g, int st) {
+    g.shown = (st == VIS_BOTH || st == VIS_BROWSE);
+    g.shown_installed = (st == VIS_BOTH || st == VIS_INSTALLED);
+}
+
+static const char *console_vis_label(int st) {
+    switch (st) {
+    case VIS_BOTH: return tr(S_VIS_BOTH);
+    case VIS_BROWSE: return tr(S_VIS_BROWSE);
+    case VIS_INSTALLED: return tr(S_VIS_INSTALLED);
+    default: return tr(S_VIS_HIDDEN);
     }
-    return is_light_theme() ? pu::ui::Color(95, 95, 105, 255)
-                            : pu::ui::Color(150, 150, 162, 255);
+}
+
+static pu::ui::Color console_vis_color(int st) {
+    bool light = is_light_theme();
+    switch (st) {
+    case VIS_BOTH: return accent_green();
+    case VIS_BROWSE: return light ? pu::ui::Color(40, 120, 200, 255)
+                                  : pu::ui::Color(150, 205, 255, 255);
+    case VIS_INSTALLED: return light ? pu::ui::Color(180, 110, 30, 255)
+                                     : pu::ui::Color(245, 175, 95, 255);
+    default: return light ? pu::ui::Color(95, 95, 105, 255)
+                          : pu::ui::Color(150, 150, 162, 255);
+    }
 }
 
 void MainApplication::GotoManage() {
@@ -3702,12 +4339,12 @@ void MainApplication::GotoManage() {
     this->layout->SetSubtitle(tr(S_SUB_MANAGE));
     this->layout->ClearMenu();
     for (int i = 0; i < g_cfg.console_count; i++) {
-        bool sh = g_cfg.consoles[i].shown;
+        int st = console_vis_state(g_cfg.consoles[i]);
         char clabel[160];
         console_label(g_cfg.consoles[i].console, clabel, sizeof(clabel));
         this->layout->AddRow2(
-            clabel, sh ? tr(S_SHOWN) : tr(S_HIDDEN),
-            g_theme->row_text, manage_state_color(sh),
+            clabel, console_vis_label(st),
+            g_theme->row_text, console_vis_color(st),
             -1.0f, console_icon(g_cfg.consoles[i].console));
     }
     if (g_cfg.console_count == 0) {
@@ -3740,12 +4377,90 @@ static const char *inst_disp_name(const DirEnt &d, bool is_root) {
     return d.name.c_str();
 }
 
+// The console whose custom install folder is exactly `path` (its own top
+// level), or nullptr. Used to recognise a custom folder as a console root.
+static ConsoleGroup *console_by_custom_folder(const std::string &path) {
+    if (!g_prefs.custom_folders) return nullptr; // master switch off: ignore folders
+    for (int i = 0; i < g_cfg.console_count; i++)
+        if (g_cfg.consoles[i].folder[0] && path == g_cfg.consoles[i].folder)
+            return &g_cfg.consoles[i];
+    return nullptr;
+}
+
+// The console owning `path`: its custom install folder or anything beneath it.
+// Lets the Installed header name the console even inside a custom subtree.
+static ConsoleGroup *console_owning_path(const std::string &path) {
+    if (!g_prefs.custom_folders) return nullptr; // master switch off: ignore folders
+    for (int i = 0; i < g_cfg.console_count; i++) {
+        const char *f = g_cfg.consoles[i].folder;
+        if (!f[0]) continue;
+        std::string fs = f;
+        if (path == fs || path.rfind(fs + "/", 0) == 0)
+            return &g_cfg.consoles[i];
+    }
+    return nullptr;
+}
+
+// Absolute path an Installed-tab entry points at: its explicit `path` override
+// (a custom-folder console), else the usual <listed folder>/<name>.
+static std::string inst_entry_path(const std::string &base, const DirEnt &e) {
+    return e.path.empty() ? base + "/" + e.name : e.path;
+}
+
+// True when `path` is a top-level console folder — either directly under the
+// ROM root (roms/<console>) or a console's exact custom folder. Such a folder
+// holds roms (so delete/rename apply) but files there can't "move up", and B
+// steps back to the console list rather than the filesystem parent.
+static bool inst_is_console_root(const std::string &path) {
+    std::string root = roms_root(&g_tico);
+    if (path == root) return false;
+    auto pp = path.find_last_of('/');
+    std::string parent = (pp == std::string::npos) ? path : path.substr(0, pp);
+    if (parent == root) return true;
+    return console_by_custom_folder(path) != nullptr;
+}
+
 void MainApplication::GotoInstalled(const std::string &path) {
     this->screen = Screen::Installed;
     this->inst_path = path;
     inst_stat_load(); // warm the folder-size cache from disk (once per session)
     g_inst = list_dir(path);
     bool is_root = (path == roms_root(&g_tico));
+    // At the roms root, honor per-console Installed visibility: a console set to
+    // hide from the Installed tab drops off here even if its folder holds files.
+    // Folders with no matching console entry are always kept. Removing them from
+    // g_inst (not just skipping in the row loop) keeps row indices aligned with
+    // the vector the input handler opens from.
+    if (is_root) {
+        g_inst.erase(std::remove_if(g_inst.begin(), g_inst.end(),
+                                    [](const DirEnt &e) {
+                                        if (!e.is_dir) return false;
+                                        ConsoleGroup *g = config_find_console(
+                                            &g_cfg, e.name.c_str());
+                                        if (!g) return false;
+                                        // Hidden from Installed, or (when custom
+                                        // folders are on) redirected to a custom
+                                        // folder — re-added below as a synthetic
+                                        // row pointing at that folder.
+                                        return !g->shown_installed ||
+                                               (g_prefs.custom_folders &&
+                                                g->folder[0]);
+                                    }),
+                     g_inst.end());
+        // Consoles with a custom install folder live outside the ROM root, so
+        // list_dir() never sees them. Surface each as a row keyed by the console
+        // name (for its icon/label/pin) but pointing at the real custom path.
+        for (int i = 0; g_prefs.custom_folders && i < g_cfg.console_count; i++) {
+            ConsoleGroup &c = g_cfg.consoles[i];
+            if (!c.folder[0] || !c.shown_installed) continue;
+            DirEnt de;
+            de.name = c.target;
+            de.is_dir = true;
+            de.size = 0;
+            de.path = c.folder;
+            g_inst.push_back(de);
+        }
+    }
     // Folders stay grouped above files, and pinned folders stay on top at the
     // root; the chosen sort orders within those groups (size applies to files).
     std::sort(g_inst.begin(), g_inst.end(), [is_root](const DirEnt &a, const DirEnt &b) {
@@ -3774,6 +4489,10 @@ void MainApplication::GotoInstalled(const std::string &path) {
             std::string rel = path.substr(root.size());
             while (!rel.empty() && rel[0] == '/') rel.erase(0, 1);
             cons = rel.substr(0, rel.find('/'));
+        } else if (ConsoleGroup *g = console_owning_path(path)) {
+            // A console's custom install folder (or a subfolder of one): it lives
+            // outside the ROM root, so name it from the owning console instead.
+            cons = g->target;
         }
     }
     if (cons.empty()) {
@@ -3796,7 +4515,7 @@ void MainApplication::GotoInstalled(const std::string &path) {
         if (e.is_dir) {
             int n = 0;
             uint64_t bytes = 0;
-            inst_dir_stats(path + "/" + e.name, &n, &bytes);
+            inst_dir_stats(inst_entry_path(path, e), &n, &bytes);
             char cnt[32];
             snprintf(cnt, sizeof(cnt), tr(S_N_APPS), n);
             // Chip text with the folder's total size: cards lead with the
@@ -4371,6 +5090,17 @@ void MainApplication::HandleInput(u64 down, u64 held,
             this->ra_cancel = true;
         }
         this->RaTick();
+        return;
+    }
+
+    // A background diagnostic is running: the network self-test holds a spinner
+    // (quick, single request), while the speed test shows live meters and lets
+    // B cancel the transfer mid-flight.
+    if (this->diag.running) {
+        if (this->diag_speed && (down & HidNpadButton_B)) {
+            this->sp_prog.cancel = 1; // curl aborts; DiagTick reaps when it lands
+        }
+        this->DiagTick();
         return;
     }
 
@@ -5028,13 +5758,13 @@ void MainApplication::HandleInput(u64 down, u64 held,
             } else if (valid &&
                        (in_cards ? (down & HidNpadButton_X) != 0
                                  : (down & HidNpadButton_Right) != 0)) {
-                // Pin/unpin — D-pad Right in the list; X in the card grid
-                // (where the D-pad navigates the grid).
+                // Pin/unpin the CONSOLE — D-pad Right in the list; X in the
+                // card grid (where the D-pad navigates the grid). This is the
+                // console's own pin, independent of the per-repo pins inside
+                // it: pinning a console no longer touches its repos.
                 int ci = g_home_map[sel];
                 ConsoleGroup *g = &g_cfg.consoles[ci];
-                bool was = console_has_pin(g);
-                for (int r = 0; r < g->repo_count; r++)
-                    g->repos[r].pinned = !was;
+                g->pinned = !g->pinned;
                 config_save(&g_cfg);
                 this->GotoHome();
                 this->layout->SetSel(0);
@@ -5171,7 +5901,8 @@ void MainApplication::HandleInput(u64 down, u64 held,
                 creds_auth_header(&g_creds, auth, sizeof(auth));
                 bool ok = queue_add(url, f->name, g_files_target, auth,
                                     f->size, is_archive_name(f->name),
-                                    f->md5);
+                                    f->md5,
+                                    install_folder_for(g_files_target));
                 if (ok) {
                     this->Toast(std::string(tr(S_QUEUED)) + ": " + f->name);
                 } else {
@@ -5224,19 +5955,21 @@ void MainApplication::HandleInput(u64 down, u64 held,
             this->GotoLog();
             return;
         } else if (down & HidNpadButton_Y) {
-            // Queue-level actions (batch): retry all failed / clear finished.
+            // Queue-level actions (batch). "Clear finished" leads as the
+            // default-highlighted option — it's the common housekeeping action
+            // and is harmless (it only drops already-completed rows).
             int r = this->CreateShowDialog(
                 tr(S_TITLE_QUEUE), "",
-                {tr(S_RETRY_ALL), tr(S_CLEAR_FINISHED), tr(S_CANCEL)}, false, {},
+                {tr(S_CLEAR_FINISHED), tr(S_RETRY_ALL), tr(S_CANCEL)}, false, {},
                 style_dialog);
             if (r == 0) {
+                queue_clear_finished();
+                this->Toast(tr(S_CLEARED));
+            } else if (r == 1) {
                 int n = queue_retry_all();
                 char t[48];
                 snprintf(t, sizeof(t), tr(S_RETRIED_N), n);
                 this->Toast(t);
-            } else if (r == 1) {
-                queue_clear_finished();
-                this->Toast(tr(S_CLEARED));
             }
         } else {
             static QueueView qv[QUEUE_MAX];
@@ -5245,15 +5978,40 @@ void MainApplication::HandleInput(u64 down, u64 held,
             if (i >= 0 && i < n) {
                 if (down & HidNpadButton_A) {
                     QStatus s = qv[i].item.status;
-                    bool cancellable =
-                        (s == Q_QUEUED || s == Q_PAUSED || s == Q_DOWNLOADING ||
-                         s == Q_VERIFYING || s == Q_AWAIT_EXTRACT ||
-                         s == Q_EXTRACTING);
-                    if (cancellable &&
-                        this->Confirm(tr(S_CANCEL),
-                                      std::string(qv[i].item.name) + "?")) {
-                        queue_cancel(qv[i].slot);
-                        this->Toast(tr(S_CANCELLED));
+                    bool processing = (s == Q_VERIFYING ||
+                                       s == Q_AWAIT_EXTRACT ||
+                                       s == Q_EXTRACTING);
+                    if (processing) {
+                        // Verify/unzip can appear to hang; rather than force a
+                        // quit, offer the three ways forward. Retry keeps the
+                        // downloaded file and re-runs the check/unpack;
+                        // Redownload drops it and pulls the file again.
+                        int r = this->CreateShowDialog(
+                            std::string(qv[i].item.name),
+                            tr(S_QUEUE_BUSY_PROMPT),
+                            {tr(S_RETRY), tr(S_REDOWNLOAD), tr(S_CANCEL_DOWNLOAD),
+                             tr(S_CANCEL)},
+                            false, {}, style_dialog);
+                        if (r == 0) {
+                            queue_requeue(qv[i].slot, false);
+                            this->Toast(tr(S_RETRYING));
+                        } else if (r == 1) {
+                            queue_requeue(qv[i].slot, true);
+                            this->Toast(tr(S_RETRYING));
+                        } else if (r == 2) {
+                            queue_cancel(qv[i].slot);
+                            this->Toast(tr(S_CANCELLED));
+                        }
+                    } else {
+                        bool cancellable = (s == Q_QUEUED || s == Q_PAUSED ||
+                                            s == Q_DOWNLOADING);
+                        if (cancellable &&
+                            this->Confirm(tr(S_CANCEL),
+                                          std::string(qv[i].item.name) + "?",
+                                          true)) {
+                            queue_cancel(qv[i].slot);
+                            this->Toast(tr(S_CANCELLED));
+                        }
                     }
                 } else if (down & HidNpadButton_X) {
                     queue_retry(qv[i].slot);
@@ -5292,79 +6050,30 @@ void MainApplication::HandleInput(u64 down, u64 held,
         if (down & HidNpadButton_B) {
             this->GotoHome();
         } else if (down & HidNpadButton_A) {
-            s32 i = this->layout->Sel();
-            switch (i) {
-            case 0: { // Check for updates: pick the source first. GitHub is the
-                      // normal release path; Wi-Fi receives a pushed .nro build
-                      // (for testing, so the same version is fine).
-                int r = this->CreateShowDialog(
-                    tr(S_TITLE_UPDATE), tr(S_UPDATE_HOW),
-                    {tr(S_UPDATE_SRC_GITHUB), tr(S_UPDATE_SRC_WIFI),
-                     tr(S_CANCEL)},
-                    true, {}, style_dialog); // last option = cancel (-1)
-                if (r == 0) {
-                    // On a background thread: the release fetch retries
-                    // transient errors and would freeze the UI.
-                    this->ChkStart();
-                } else if (r == 1) {
-                    this->UpdateWifiStart();
-                }
-                return;
-            }
-            case 1: // User interface settings (theme/cards/consoles/language)
-                this->GotoUISettings();
-                return;
-            case 2: // Advanced settings
-                this->GotoAdvanced();
-                return;
-            case 3: // View logs (download history + debug log)
-                this->GotoViewLogs();
-                return;
-            case 4: // Manage data (downloads folder + metadata cache)
-                this->GotoManageData();
-                return;
-            case 5: { // Credits
-                // Big app badge beside the text. Loaded fresh into a handle the
-                // dialog owns and frees on close (so it can't touch the shared
-                // header/console icon cache).
-                pu::sdl2::TextureHandle::Ref logo = {};
-                auto tex = pu::ui::render::LoadImageFromFile(
-                    "romfs:/credits_logo.png");
-                if (tex) {
-                    logo = pu::sdl2::TextureHandle::New(tex);
-                }
-                // "Release notes" is a real option (index 0); OK is the cancel
-                // option, so it and B both return -1.
-                int cr = this->CreateShowDialog(
-                    tr(S_CREDITS),
-                    std::string("HaulNX v") + APP_VERSION_STR + " by digdat0\n\n"
-                    "Plutonium UI library provided by XorTroll",
-                    {tr(S_RELEASE_NOTES), tr(S_OK)}, true, logo, style_dialog);
-                if (cr == 0) {
-                    // return, not break: skip the GotoSettings() below so the
-                    // release-notes fetch keeps its spinner instead of being
-                    // torn down and redrawn as Settings.
-                    this->GotoReleaseNotes();
-                    return;
-                }
-                break;
-            }
-            default:
-                break;
-            }
-            if (this->screen == Screen::Settings) {
-                this->GotoSettings();
+            // Every top-level row opens a single-concern sub-screen; the row
+            // order here is the contract with GotoSettings' kEntries.
+            switch (this->layout->Sel()) {
+            case 0: this->GotoAppearance();  return;
+            case 1: this->GotoDlPrefs();     return;
+            case 2: this->GotoSources();     return;
+            case 3: this->GotoStorage();     return;
+            case 4: this->GotoTransfers();   return;
+            case 5: this->GotoAccount();     return;
+            case 6: this->GotoUpdates();     return;
+            case 7: this->GotoViewLogs();    return;
+            case 8: this->GotoDiagnostics(); return;
+            case 9: this->GotoAbout();       return;
+            default: break;
             }
         }
         break;
     }
 
-    case Screen::Advanced: {
+    case Screen::DlPrefs: {
         if (down & HidNpadButton_B) {
             this->GotoSettings();
         } else if (down & HidNpadButton_A) {
-            s32 i = this->layout->Sel();
-            switch (i) {
+            switch (this->layout->Sel()) {
             case 0:
                 g_prefs.max_downloads = (g_prefs.max_downloads % 10) + 1;
                 queue_set_max_dl(g_prefs.max_downloads);
@@ -5381,30 +6090,19 @@ void MainApplication::HandleInput(u64 down, u64 held,
                 prefs_save(&g_prefs);
                 break;
             case 3:
-                g_prefs.prevent_sleep = !g_prefs.prevent_sleep;
-                prefs_save(&g_prefs);
-                break;
-            case 4:
-                g_prefs.net_check = !g_prefs.net_check;
-                prefs_save(&g_prefs);
-                break;
-            case 5:
-                g_prefs.chk_updates = !g_prefs.chk_updates;
-                prefs_save(&g_prefs);
-                break;
-            case 6:
                 g_prefs.skip_installed = !g_prefs.skip_installed;
                 prefs_save(&g_prefs);
                 break;
-            case 7:
-                this->GotoCreds();
-                return;
+            case 4:
+                g_prefs.prevent_sleep = !g_prefs.prevent_sleep;
+                prefs_save(&g_prefs);
+                break;
             default:
                 break;
             }
-            if (this->screen == Screen::Advanced) {
+            if (this->screen == Screen::DlPrefs) {
                 s32 sel = this->layout->Sel();
-                this->GotoAdvanced();
+                this->GotoDlPrefs();
                 this->layout->SetSel(sel);
             }
         } else if (down & (HidNpadButton_Left | HidNpadButton_Right)) {
@@ -5430,7 +6128,7 @@ void MainApplication::HandleInput(u64 down, u64 held,
             if (changed) {
                 prefs_save(&g_prefs);
                 s32 sel = this->layout->Sel();
-                this->GotoAdvanced();
+                this->GotoDlPrefs();
                 this->layout->SetSel(sel);
             }
         }
@@ -5441,6 +6139,8 @@ void MainApplication::HandleInput(u64 down, u64 held,
         // Apply a chosen ROM root (empty string = reset to auto), then return
         // to Manage data. queue.c holds a pointer into g_tico.roms_path, so
         // rewriting that buffer takes effect without restarting the queue.
+        bool per_console = (this->picker_console >= 0 &&
+                            this->picker_console < g_cfg.console_count);
         auto apply_roms = [&](const char *chosen) {
             char norm[512];
             roms_normalize_path(chosen, norm, sizeof(norm));
@@ -5452,12 +6152,34 @@ void MainApplication::HandleInput(u64 down, u64 held,
             this->inst_path = roms_root(&g_tico);
             this->Toast(norm[0] ? tr(S_ROMS_OVERRIDE_SET)
                                 : tr(S_ROMS_OVERRIDE_CLEARED));
-            this->GotoManageData();
+            this->GotoStorage(); // ROM folder lives under Storage now
+        };
+        // Set (or, with chosen=="", clear) this console's custom install folder,
+        // then return to the per-console folder list.
+        auto apply_console = [&](const char *chosen) {
+            char norm[512];
+            roms_normalize_path(chosen, norm, sizeof(norm));
+            int ci = this->picker_console;
+            snprintf(g_cfg.consoles[ci].folder,
+                     sizeof(g_cfg.consoles[ci].folder), "%s", norm);
+            config_save(&g_cfg);
+            this->Toast(norm[0] ? tr(S_INSTALL_FOLDER_SET)
+                                : tr(S_INSTALL_FOLDER_CLEARED));
+            this->picker_console = -1;
+            this->GotoInstallFolders();
+            this->layout->SetSel(ci); // keep the cursor on the edited console
         };
         bool at_root = (this->picker_path == "sdmc:/");
         if (down & HidNpadButton_B) {
             if (at_root) {
-                this->GotoManageData();
+                if (per_console) {
+                    int ci = this->picker_console;
+                    this->picker_console = -1;
+                    this->GotoInstallFolders();
+                    this->layout->SetSel(ci);
+                } else {
+                    this->GotoStorage();
+                }
             } else {
                 // Up one level (never above the SD root).
                 std::string up = this->picker_path;
@@ -5476,27 +6198,37 @@ void MainApplication::HandleInput(u64 down, u64 held,
                 this->GotoRomPicker(next);
             }
         } else if (down & HidNpadButton_X) {
-            // Use the folder currently being browsed as the ROM root.
+            // Use the folder currently being browsed.
             if (at_root) {
                 this->ToastErr(tr(S_ROMS_USE_ROOT_WARN));
+            } else if (per_console) {
+                if (this->Confirm(tr(S_INSTALL_FOLDER),
+                                  this->picker_path + "\n\n" +
+                                      tr(S_INSTALL_FOLDER_WARN))) {
+                    apply_console(this->picker_path.c_str());
+                }
             } else if (this->Confirm(tr(S_ROMS_OVERRIDE_TITLE),
                                      this->picker_path + "\n\n" +
                                          tr(S_ROMS_OVERRIDE_WARN))) {
                 apply_roms(this->picker_path.c_str());
             }
         } else if (down & HidNpadButton_Y) {
-            // Reset to the default ROM folder (sd:/roms).
-            apply_roms("");
+            // Reset to the default: the ROM root, or this console's default
+            // <ROM root>/<console> folder.
+            if (per_console) {
+                apply_console("");
+            } else {
+                apply_roms("");
+            }
         }
         break;
     }
 
-    case Screen::UISettings: {
+    case Screen::Appearance: {
         if (down & HidNpadButton_B) {
             this->GotoSettings();
         } else if (down & HidNpadButton_A) {
-            s32 i = this->layout->Sel();
-            switch (i) {
+            switch (this->layout->Sel()) {
             case 0: // console lists as a card grid
                 g_prefs.card_view = !g_prefs.card_view;
                 prefs_save(&g_prefs);
@@ -5512,24 +6244,18 @@ void MainApplication::HandleInput(u64 down, u64 held,
                 this->SyncTab();
                 break;
             case 2:
-                this->GotoLanguage();
-                return;
-            case 3:
                 g_prefs.group_consoles = !g_prefs.group_consoles;
                 prefs_save(&g_prefs);
                 break;
-            case 4:
-                this->GotoManage();
-                return;
-            case 5: // Filter out file extensions (opens the editor)
-                this->GotoExtFilter();
+            case 3:
+                this->GotoLanguage();
                 return;
             default:
                 break;
             }
-            if (this->screen == Screen::UISettings) {
+            if (this->screen == Screen::Appearance) {
                 s32 sel = this->layout->Sel();
-                this->GotoUISettings();
+                this->GotoAppearance();
                 this->layout->SetSel(sel);
             }
         }
@@ -5538,8 +6264,29 @@ void MainApplication::HandleInput(u64 down, u64 held,
 
     case Screen::ExtFilter: {
         int n = g_prefs.exclude_ext_count;
+        // Prompt for and append a new extension. Shared by A (on the "Add
+        // extension" row) and Y (from anywhere, so the user needn't scroll to
+        // the bottom of the list to reach it).
+        auto add_ext = [this]() {
+            char ext[16] = {0};
+            if (prompt_raw(tr(S_ADD_EXT_PROMPT), nullptr, ext, sizeof(ext)) &&
+                ext[0]) {
+                if (prefs_ext_add(&g_prefs, ext)) {
+                    prefs_save(&g_prefs);
+                } else {
+                    this->ToastErr(tr(S_EXT_ADD_FAILED));
+                }
+            }
+        };
         if (down & HidNpadButton_B) {
-            this->GotoUISettings();
+            this->GotoSources();
+        } else if (down & HidNpadButton_Y) { // add from any row
+            add_ext();
+            if (this->screen == Screen::ExtFilter) {
+                // Land the cursor on the freshly added extension (last one).
+                this->GotoExtFilter();
+                this->layout->SetSel(g_prefs.exclude_ext_count);
+            }
         } else if (down & HidNpadButton_A) {
             s32 i = this->layout->Sel();
             if (i == 0) { // master switch
@@ -5550,15 +6297,7 @@ void MainApplication::HandleInput(u64 down, u64 held,
                 fe->enabled = !fe->enabled;
                 prefs_save(&g_prefs);
             } else if (i == n + 1) { // add a custom extension
-                char ext[16] = {0};
-                if (prompt_raw(tr(S_ADD_EXT_PROMPT), nullptr, ext, sizeof(ext)) &&
-                    ext[0]) {
-                    if (prefs_ext_add(&g_prefs, ext)) {
-                        prefs_save(&g_prefs);
-                    } else {
-                        this->ToastErr(tr(S_EXT_ADD_FAILED));
-                    }
-                }
+                add_ext();
             }
             if (this->screen == Screen::ExtFilter) {
                 s32 sel = this->layout->Sel();
@@ -5579,7 +6318,7 @@ void MainApplication::HandleInput(u64 down, u64 held,
 
     case Screen::Language: {
         if (down & HidNpadButton_B) {
-            this->GotoUISettings();
+            this->GotoAppearance();
         } else if (down & HidNpadButton_A) {
             s32 i = this->layout->Sel();
             if (i >= 0 && i < g_lang_count) {
@@ -5605,44 +6344,271 @@ void MainApplication::HandleInput(u64 down, u64 held,
         break;
     }
 
-    case Screen::ManageData: {
+    case Screen::Transfers: {
         if (down & HidNpadButton_B) {
             this->GotoSettings();
         } else if (down & HidNpadButton_A) {
             switch (this->layout->Sel()) {
-            case 0: this->ImportStart(); return;  // receive dl_sources.json
-            case 1: this->RestoreBackup(); return;
-            case 2: { // ROM folder — browse the SD card and pick a folder
-                /* Start inside the current override if it still exists,
-                 * otherwise at the SD-card root. */
+            case 0: this->ImportStart();    return; // receive dl_sources.json
+            case 1: this->ExportStart();    return; // serve dl_sources.json
+            case 2: this->RestoreBackup();  return; // restore previous
+            default: break;
+            }
+        }
+        break;
+    }
+
+    case Screen::Sources: {
+        if (down & HidNpadButton_B) {
+            this->GotoSettings();
+        } else if (down & HidNpadButton_A) {
+            switch (this->layout->Sel()) {
+            case 0: this->GotoManage();    return; // consoles/repos
+            case 1: this->GotoExtFilter(); return; // file-type filter editor
+            default: break;
+            }
+        }
+        break;
+    }
+
+    case Screen::Storage: {
+        if (down & HidNpadButton_B) {
+            this->GotoSettings();
+        } else if (down & HidNpadButton_A) {
+            switch (this->layout->Sel()) {
+            case 0: this->StorageDetail(); return; // SD used/free breakdown
+            case 1: { // ROM folder — browse the SD card and pick a folder
                 std::string start = "sdmc:/";
                 if (g_prefs.roms_override[0] &&
                     fs_exists(g_prefs.roms_override)) {
                     start = g_prefs.roms_override;
                 }
+                this->picker_console = -1; // picking the ROM root, not a console
                 this->GotoRomPicker(start);
                 return;
             }
-            case 3: this->GotoDownloads(); return;
-            case 4: this->GotoCache(); return;
+            case 2: // Install-folder mode: single ROM folder vs per-console
+                g_prefs.custom_folders = !g_prefs.custom_folders;
+                prefs_save(&g_prefs);
+                break;
+            case 3: // Per-console folders (only when custom mode is on)
+                if (g_prefs.custom_folders) {
+                    this->GotoInstallFolders();
+                    return;
+                }
+                this->Toast(tr(S_CONSOLE_FOLDERS_LOCKED));
+                return;
+            case 4: this->GotoDownloads(); return; // download scratch folder
             case 5: // Metadata cache on/off
                 g_prefs.use_cache = !g_prefs.use_cache;
                 prefs_save(&g_prefs);
                 break;
-            case 6: this->RaStart(); return;      // refresh all metadata
+            case 6: this->GotoCache(); return;     // browse/clear the cache
+            case 7: this->RaStart();   return;     // refresh all metadata
             default: break;
             }
-            if (this->screen == Screen::ManageData) {
+            if (this->screen == Screen::Storage) {
                 s32 sel = this->layout->Sel();
-                this->GotoManageData();
+                this->GotoStorage();
                 this->layout->SetSel(sel);
             }
         } else if (down & (HidNpadButton_Left | HidNpadButton_Right)) {
-            if (this->layout->Sel() == 5) { // Metadata cache on/off
+            s32 sel = this->layout->Sel();
+            if (sel == 2) { // Install-folder mode
+                g_prefs.custom_folders = !g_prefs.custom_folders;
+                prefs_save(&g_prefs);
+            } else if (sel == 5) { // Metadata cache on/off
                 g_prefs.use_cache = !g_prefs.use_cache;
                 prefs_save(&g_prefs);
+            } else {
+                break;
+            }
+            this->GotoStorage();
+            this->layout->SetSel(sel);
+        }
+        break;
+    }
+
+    case Screen::InstallFolders: {
+        if (down & HidNpadButton_B) {
+            this->GotoStorage();
+            this->layout->SetSel(3); // land back on the "Console folders" row
+        } else if ((down & HidNpadButton_A) &&
+                   this->layout->Sel() < g_cfg.console_count) {
+            // Choose this console's install folder. Start browsing at its current
+            // custom folder if it still exists, else the SD root.
+            int ci = this->layout->Sel();
+            this->picker_console = ci;
+            std::string start = "sdmc:/";
+            const char *f = g_cfg.consoles[ci].folder;
+            if (f[0] && fs_exists(f)) start = f;
+            this->GotoRomPicker(start);
+        }
+        break;
+    }
+
+    case Screen::Account: {
+        if (down & HidNpadButton_B) {
+            this->GotoSettings();
+        } else if (down & HidNpadButton_A) {
+            switch (this->layout->Sel()) {
+            case 0: this->GotoCreds(); return; // archive.org credentials
+            case 1: // Warn if offline at startup
+                g_prefs.net_check = !g_prefs.net_check;
+                prefs_save(&g_prefs);
+                break;
+            default: break;
+            }
+            if (this->screen == Screen::Account) {
                 s32 sel = this->layout->Sel();
-                this->GotoManageData();
+                this->GotoAccount();
+                this->layout->SetSel(sel);
+            }
+        } else if (down & (HidNpadButton_Left | HidNpadButton_Right)) {
+            if (this->layout->Sel() == 1) {
+                g_prefs.net_check = !g_prefs.net_check;
+                prefs_save(&g_prefs);
+                s32 sel = this->layout->Sel();
+                this->GotoAccount();
+                this->layout->SetSel(sel);
+            }
+        }
+        break;
+    }
+
+    case Screen::Updates: {
+        if (down & HidNpadButton_B) {
+            this->GotoSettings();
+        } else if (down & HidNpadButton_A) {
+            switch (this->layout->Sel()) {
+            case 0: // Check GitHub for an update, straight away (Wi-Fi push is
+                    // its own row now, so no source picker is needed here).
+                this->ChkStart(); // background thread; retries won't freeze UI
+                return;
+            case 1: this->UpdateWifiStart(); return; // receive a pushed .nro
+            case 2: // Check for updates on startup
+                g_prefs.chk_updates = !g_prefs.chk_updates;
+                prefs_save(&g_prefs);
+                break;
+            default: break;
+            }
+            if (this->screen == Screen::Updates) {
+                s32 sel = this->layout->Sel();
+                this->GotoUpdates();
+                this->layout->SetSel(sel);
+            }
+        } else if (down & (HidNpadButton_Left | HidNpadButton_Right)) {
+            if (this->layout->Sel() == 2) {
+                g_prefs.chk_updates = !g_prefs.chk_updates;
+                prefs_save(&g_prefs);
+                s32 sel = this->layout->Sel();
+                this->GotoUpdates();
+                this->layout->SetSel(sel);
+            }
+        }
+        break;
+    }
+
+    case Screen::Diagnostics: {
+        if (down & HidNpadButton_B) {
+            this->GotoSettings();
+        } else if (down & HidNpadButton_A) {
+            switch (this->layout->Sel()) {
+            case 0: this->ExportBundle();  break;  // write one bundle file
+            case 1: this->NetSelfTest();   return; // background LAN + net check
+            case 2: this->SpeedTest();     return; // background download test
+            case 3: this->GotoExtTuning(); return; // extraction knobs (dev)
+            case 4: this->ResetDefaults(); return; // factory-reset settings
+            default: break;
+            }
+            if (this->screen == Screen::Diagnostics) {
+                s32 sel = this->layout->Sel();
+                this->GotoDiagnostics();
+                this->layout->SetSel(sel);
+            }
+        }
+        break;
+    }
+
+    case Screen::ExtTuning: {
+        if (down & HidNpadButton_B) {
+            this->GotoDiagnostics();
+        } else if (down & HidNpadButton_A) {
+            switch (this->layout->Sel()) {
+            case 0:
+                g_prefs.ex_bench = !g_prefs.ex_bench;
+                apply_extract_tunables();
+                prefs_save(&g_prefs);
+                break;
+            case 1:
+                g_prefs.ex_prealloc = !g_prefs.ex_prealloc;
+                apply_extract_tunables();
+                prefs_save(&g_prefs);
+                break;
+            case 2:
+                g_prefs.ex_chunk_mb = ex_chunk_step(g_prefs.ex_chunk_mb, +1);
+                apply_extract_tunables();
+                prefs_save(&g_prefs);
+                break;
+            default: break;
+            }
+            if (this->screen == Screen::ExtTuning) {
+                s32 sel = this->layout->Sel();
+                this->GotoExtTuning();
+                this->layout->SetSel(sel);
+            }
+        } else if (down & (HidNpadButton_Left | HidNpadButton_Right)) {
+            if (this->layout->Sel() == 2) {
+                int dir = (down & HidNpadButton_Right) ? +1 : -1;
+                g_prefs.ex_chunk_mb = ex_chunk_step(g_prefs.ex_chunk_mb, dir);
+                apply_extract_tunables();
+                prefs_save(&g_prefs);
+                s32 sel = this->layout->Sel();
+                this->GotoExtTuning();
+                this->layout->SetSel(sel);
+            }
+        }
+        break;
+    }
+
+    case Screen::About: {
+        if (down & HidNpadButton_B) {
+            this->GotoSettings();
+        } else if (down & HidNpadButton_A) {
+            switch (this->layout->Sel()) {
+            case 0: this->GettingStarted(); return; // re-run onboarding
+            case 1: this->GotoReleaseNotes(); return; // origin=About via screen
+            case 2: { // Credits
+                // Big app badge beside the text. Loaded fresh into a handle the
+                // dialog owns and frees on close (so it can't touch the shared
+                // header/console icon cache).
+                pu::sdl2::TextureHandle::Ref logo = {};
+                auto tex = pu::ui::render::LoadImageFromFile(
+                    "romfs:/credits_logo.png");
+                if (tex) {
+                    logo = pu::sdl2::TextureHandle::New(tex);
+                }
+                // "Release notes" is a real option (index 0); OK is the cancel
+                // option, so it and B both return -1.
+                int cr = this->CreateShowDialog(
+                    tr(S_CREDITS),
+                    std::string("HaulNX v") + APP_VERSION_STR + " by digdat0\n\n"
+                    "Plutonium UI library provided by XorTroll",
+                    {tr(S_RELEASE_NOTES), tr(S_OK)}, true, logo, style_dialog);
+                if (cr == 0) {
+                    // return, not break: skip the GotoAbout() below so the
+                    // release-notes fetch keeps its spinner instead of being
+                    // torn down and redrawn.
+                    this->GotoReleaseNotes();
+                    return;
+                }
+                break;
+            }
+            default: break;
+            }
+            if (this->screen == Screen::About) {
+                s32 sel = this->layout->Sel();
+                this->GotoAbout();
                 this->layout->SetSel(sel);
             }
         }
@@ -5651,14 +6617,18 @@ void MainApplication::HandleInput(u64 down, u64 held,
 
     case Screen::ViewLogs: {
         if (down & HidNpadButton_B) {
-            this->GotoSettings();
+            this->GotoSettings(); // Logs is a top-level Settings section now
         } else if (down & HidNpadButton_A) {
             switch (this->layout->Sel()) {
             case 0: this->GotoLog(); return;          // download history
             case 1: this->GotoDebugLog(); return;     // debug.log
             case 2: this->GotoQueueState(); return;   // queue.json
             case 3: this->GotoXferLog(); return;      // transfers.log
-            case 4: this->GotoReleaseNotes(); return; // release history
+            case 4:                                    // speedtest.log
+                this->GotoTextLog(SPEEDLOG_PATH, tr(S_TITLE_SPEEDTEST_LOG),
+                                  S_CLEAR_SPEEDTEST_CONFIRM);
+                return;
+            case 5: this->GotoReleaseNotes(); return; // release history
             default: break;
             }
         }
@@ -5691,8 +6661,8 @@ void MainApplication::HandleInput(u64 down, u64 held,
         if (down & HidNpadButton_B) {
             // Back to wherever it was opened from (View logs, or Settings when
             // reached via the credits dialog).
-            if (this->notes_origin == Screen::Settings) {
-                this->GotoSettings();
+            if (this->notes_origin == Screen::About) {
+                this->GotoAbout();
             } else {
                 this->GotoViewLogs();
             }
@@ -5741,7 +6711,7 @@ void MainApplication::HandleInput(u64 down, u64 held,
 
     case Screen::Downloads: {
         if (down & HidNpadButton_B) {
-            this->GotoManageData();
+            this->GotoStorage();
         } else if (down & HidNpadButton_Y) {
             s32 i = this->layout->Sel();
             if (i >= 0 && i < (s32)g_dlfiles.size()) {
@@ -5839,7 +6809,7 @@ void MainApplication::HandleInput(u64 down, u64 held,
 
     case Screen::Cache: {
         if (down & HidNpadButton_B) {
-            this->GotoManageData();
+            this->GotoStorage();
         } else if (down & HidNpadButton_A) {
             // File info (A = open/inspect everywhere; never destructive).
             s32 i = this->layout->Sel();
@@ -5889,6 +6859,10 @@ void MainApplication::HandleInput(u64 down, u64 held,
         if (down & HidNpadButton_B) {
             if (this->inst_path == roms_root(&g_tico)) {
                 this->GotoHome();
+            } else if (inst_is_console_root(this->inst_path)) {
+                // A console folder (incl. a custom one outside the ROM root):
+                // step back to the console list, not the filesystem parent.
+                this->GotoInstalled(roms_root(&g_tico));
             } else {
                 auto p = this->inst_path.find_last_of('/');
                 this->GotoInstalled(p == std::string::npos
@@ -5899,7 +6873,8 @@ void MainApplication::HandleInput(u64 down, u64 held,
             s32 i = this->layout->Sel();
             if (i >= 0 && i < (s32)g_inst.size()) {
                 if (g_inst[i].is_dir) {
-                    this->GotoInstalled(this->inst_path + "/" + g_inst[i].name);
+                    this->GotoInstalled(inst_entry_path(this->inst_path,
+                                                        g_inst[i]));
                     break;
                 }
                 // "Move up one folder" is offered only from a *sub*folder
@@ -5907,11 +6882,11 @@ void MainApplication::HandleInput(u64 down, u64 held,
                 // files belong in the console folder, so we don't let them
                 // escape upward into the roms root.
                 std::string root = roms_root(&g_tico);
-                auto pp = this->inst_path.find_last_of('/');
-                std::string parent = (pp == std::string::npos)
-                                         ? this->inst_path
-                                         : this->inst_path.substr(0, pp);
-                bool can_move = this->inst_path != root && parent != root;
+                // Only a real subfolder can move up: never the ROM root and
+                // never a console folder itself (a custom-folder console counts
+                // as a console folder even though it sits outside the root).
+                bool can_move = this->inst_path != root &&
+                                !inst_is_console_root(this->inst_path);
                 // With files marked (Y) in a movable subfolder, the dialog lists
                 // the whole selection and moves it as a batch; otherwise it acts
                 // on the single file under the cursor.
@@ -6240,7 +7215,8 @@ void MainApplication::HandleInput(u64 down, u64 held,
                         creds_auth_header(&g_creds, auth, sizeof(auth));
                         bool ok = queue_add(e.url.c_str(), e.name.c_str(),
                                             e.target.c_str(), auth, e.size,
-                                            e.is_archive, e.md5.c_str());
+                                            e.is_archive, e.md5.c_str(),
+                                            install_folder_for(e.target.c_str()));
                         if (ok)
                             this->Toast(std::string(tr(S_QUEUED)) + ": " +
                                         e.name);
@@ -6267,18 +7243,19 @@ void MainApplication::HandleInput(u64 down, u64 held,
 
     case Screen::Manage: {
         if (down & HidNpadButton_B) {
-            this->GotoUISettings(); // manage consoles lives under UI settings
+            this->GotoSources(); // manage consoles lives under Sources now
         } else if (down & HidNpadButton_A) {
             s32 i = this->layout->Sel();
             if (i >= 0 && i < g_cfg.console_count) {
-                bool sh = !g_cfg.consoles[i].shown;
-                g_cfg.consoles[i].shown = sh;
+                // Cycle Both -> Browse only -> Installed only -> Hidden -> Both.
+                int st = (console_vis_state(g_cfg.consoles[i]) + 1) % 4;
+                console_vis_apply(g_cfg.consoles[i], st);
                 config_save(&g_cfg);
                 // Update just this row's state label in place — a full
                 // GotoManage() rebuild resets scroll_top, which then re-scrolls
                 // the selected row to the bottom of the viewport.
-                this->layout->SetRowRight(i, sh ? tr(S_SHOWN) : tr(S_HIDDEN),
-                                          manage_state_color(sh));
+                this->layout->SetRowRight(i, console_vis_label(st),
+                                          console_vis_color(st));
             }
         }
         break;
@@ -6286,7 +7263,7 @@ void MainApplication::HandleInput(u64 down, u64 held,
 
     case Screen::Creds: {
         if (down & HidNpadButton_B) {
-            this->GotoAdvanced();
+            this->GotoAccount();
         } else if (down & HidNpadButton_A) {
             s32 i = this->layout->Sel();
             char v[1024] = {0};
@@ -6351,7 +7328,8 @@ void MainApplication::HandleInput(u64 down, u64 held,
                 creds_auth_header(&g_creds, auth, sizeof(auth));
                 bool ok = queue_add(h.url.c_str(), h.name.c_str(),
                                     h.target.c_str(), auth, h.size,
-                                    h.is_archive, h.md5.c_str());
+                                    h.is_archive, h.md5.c_str(),
+                                    install_folder_for(h.target.c_str()));
                 if (ok)
                     this->Toast(std::string(tr(S_QUEUED)) + ": " + h.name);
                 else
@@ -6402,6 +7380,7 @@ void MainApplication::OnLoad() {
     }
     queue_init(roms_root(&g_tico), g_prefs.max_downloads);
     apply_rate_limits(); /* seed the throttle from saved prefs */
+    apply_extract_tunables(); /* seed the extraction knobs from saved prefs */
     cleanup_stale_parts(); // drop unresumable old-format .part leftovers
     load_console_icons();  // romfs:/icons/<key>.png, shared into list rows
 
@@ -6557,17 +7536,18 @@ void MainApplication::ChkFinish() {
     {
         char umsg[128];
         snprintf(umsg, sizeof(umsg), tr(S_UPDATE_CONFIRM), this->chk_tag);
-        // Cancel(0) first so it's the safe default; "Release notes" lets the user
-        // see what's in the new version before committing to the update. It opens
-        // the release list (screen is Settings here, so B returns to Settings).
+        // Yes(0) first so it's the default (leftmost) focus — the user asked to
+        // check for updates, so accepting is the expected action. "Release notes"
+        // lets them see what's in the new version first; Cancel is the last option
+        // and doubles as B (use_last_opt_as_cancel), returning to Settings.
         int r = this->CreateShowDialog(tr(S_TITLE_UPDATE), umsg,
-                                       {tr(S_CANCEL), tr(S_RELEASE_NOTES), tr(S_YES)},
-                                       false, {}, style_dialog);
+                                       {tr(S_YES), tr(S_RELEASE_NOTES), tr(S_CANCEL)},
+                                       true, {}, style_dialog);
         if (r == 1) {
             this->GotoReleaseNotes();
             return;
         }
-        if (r != 2) {
+        if (r != 0) {
             this->GotoSettings();
             return;
         }
@@ -6749,8 +7729,8 @@ void MainApplication::NotesTick() {
     if (!this->notes_ok) {
         this->CreateShowDialog(tr(S_RELEASE_NOTES), tr(S_UPDATE_FETCH_FAIL),
                                {tr(S_OK)}, true, {}, style_dialog);
-        if (this->notes_origin == Screen::Settings) {
-            this->GotoSettings();
+        if (this->notes_origin == Screen::About) {
+            this->GotoAbout();
         } else {
             this->GotoViewLogs();
         }

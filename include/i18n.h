@@ -112,6 +112,21 @@ enum {
     S_ROMS_CURRENT,
     S_NO_SUBFOLDERS,
     S_ROMS_USE_ROOT_WARN,
+    /* ---- per-console custom install folder ---- */
+    S_INSTALL_FOLDER,         /* dialog title when choosing a console folder */
+    S_INSTALL_FOLDER_DEFAULT, /* value when no custom folder is set */
+    S_INSTALL_FOLDER_WARN,    /* confirm body when choosing a folder */
+    S_INSTALL_FOLDER_SET,     /* toast after setting one */
+    S_INSTALL_FOLDER_CLEARED, /* toast after resetting to default */
+    S_INSTALL_MODE,           /* Storage row: install-folder mode */
+    S_INSTALL_MODE_DEFAULT,   /* value: single ROM folder for every console */
+    S_INSTALL_MODE_CUSTOM,    /* value: a folder per console */
+    S_CONSOLE_FOLDERS,        /* Storage row: open the per-console folder list */
+    S_CONSOLE_FOLDERS_LOCKED, /* toast when the row is used in default mode */
+    S_TITLE_CONSOLE_FOLDERS,  /* per-console folder list title */
+    S_SUB_CONSOLE_FOLDERS,    /* per-console folder list subtitle */
+    S_OPEN,                   /* right-cell value: actionable */
+    S_LOCKED,                 /* right-cell value: disabled until unlocked */
 
     /* ---- downloads folder ---- */
     S_TITLE_DOWNLOADS,
@@ -161,8 +176,10 @@ enum {
     /* ---- manage consoles ---- */
     S_TITLE_MANAGE,
     S_SUB_MANAGE,
-    S_SHOWN,
-    S_HIDDEN,
+    S_VIS_BOTH,      /* console shows on both Browse and Installed */
+    S_VIS_BROWSE,    /* Browse only */
+    S_VIS_INSTALLED, /* Installed only */
+    S_VIS_HIDDEN,    /* neither tab */
 
     /* ---- credentials ---- */
     S_TITLE_CREDS,
@@ -212,6 +229,9 @@ enum {
     S_NO_NETWORK,
     S_NO_NETWORK_MSG,
     S_RETRY,
+    S_REDOWNLOAD,       /* queue action: drop the file and pull it again */
+    S_CANCEL_DOWNLOAD,  /* queue action: abort the item */
+    S_QUEUE_BUSY_PROMPT, /* menu shown for an item stuck verifying/unzipping */
 
     /* ---- repo edit labels ---- */
     S_LABEL_NAME,
@@ -334,6 +354,12 @@ enum {
     S_IMPORT_DONE,
     S_IMPORT_SAVE_FAIL,
 
+    /* ---- export collection over the LAN (mirror of import) ---- */
+    S_EXPORT_COLLECTION,
+    S_TITLE_EXPORT,
+    S_SUB_EXPORT,
+    S_EXPORT_STEPS,
+
     /* ---- update source prompt + update-over-Wi-Fi receive screen ---- */
     S_UPDATE_HOW,
     S_UPDATE_SRC_GITHUB,
@@ -351,6 +377,10 @@ enum {
     S_XFER_LOG,
     S_TITLE_XFER_LOG,
     S_CLEAR_XFER_CONFIRM,
+
+    S_SPEEDTEST_LOG,
+    S_TITLE_SPEEDTEST_LOG,
+    S_CLEAR_SPEEDTEST_CONFIRM,
 
     /* ---- restore the backup an import left behind ---- */
     S_RESTORE_COLLECTION,
@@ -401,6 +431,75 @@ enum {
     S_ALL_ALREADY_INSTALLED,
     S_SKIP_INSTALLED,        /* advanced toggle */
     S_SPACE_HOLD,            /* queue status: waiting for space, nothing failed */
+
+    /* ---- extraction benchmark knobs (Advanced; dev/perf tuning) ---- */
+    S_EX_BENCH,              /* toggle: log per-archive extraction throughput */
+    S_EX_PREALLOC,           /* toggle: preallocate output files */
+    S_EX_CHUNK,              /* value: write chunk size (1/2/4 MB) */
+
+    /* ==== reorganized settings hierarchy (v2) ============================= */
+    /* Top-level section rows on the Settings screen. */
+    S_SEC_APPEARANCE,
+    S_SEC_DOWNLOADS,
+    S_SEC_SOURCES,
+    S_SEC_STORAGE,
+    S_SEC_TRANSFERS,
+    S_SEC_ACCOUNT,
+    S_SEC_UPDATES,
+    S_SEC_LOGS,
+    S_SEC_DIAGNOSTICS,
+    S_SEC_ABOUT,
+
+    /* Titles + subtitles for the reorganized / new sub-screens. */
+    S_TITLE_APPEARANCE,   S_SUB_APPEARANCE,
+    S_TITLE_DLPREFS,      S_SUB_DLPREFS,
+    S_TITLE_SOURCES,      S_SUB_SOURCES,
+    S_TITLE_STORAGE,      S_SUB_STORAGE,
+    S_TITLE_TRANSFERS,    S_SUB_TRANSFERS,
+    S_TITLE_ACCOUNT,      S_SUB_ACCOUNT,
+    S_TITLE_UPDATES,      S_SUB_UPDATES,
+    S_TITLE_DIAGNOSTICS,  S_SUB_DIAGNOSTICS,
+    S_TITLE_ABOUT,        S_SUB_ABOUT,
+    S_TITLE_EXT_TUNING,   S_SUB_EXT_TUNING,
+
+    /* New row labels. */
+    S_KEEP_AWAKE,         /* Downloads: keep awake while downloading */
+    S_UPDATE_OVER_WIFI,   /* Transfers: receive a pushed .nro build */
+    S_CHECK_NOW,          /* Updates: run a check right now */
+    S_SD_CARD,            /* Storage: SD-card status row label */
+    S_SD_FREE_OF,         /* "%s free of %s" — SD status value */
+    S_MANAGE_META,        /* Storage: open the metadata-cache manager */
+    S_EXT_TUNING,         /* Diagnostics: open the extraction-tuning sub-screen */
+
+    /* Diagnostics build features + their results. */
+    S_EXPORT_BUNDLE,
+    S_BUNDLE_DONE,        /* "Saved debug bundle to %s" */
+    S_BUNDLE_FAIL,
+    S_NET_SELFTEST,
+    S_SELFTEST_RUNNING,
+    S_SELFTEST_RESULT,    /* dialog body: "%s\n%s" (LAN line, internet line) */
+    S_SELFTEST_LAN_OK,    /* "LAN address: %s" */
+    S_SELFTEST_LAN_FAIL,
+    S_SELFTEST_NET_OK,
+    S_SELFTEST_NET_FAIL,
+    S_SPEEDTEST,          /* Diagnostics: run a download + upload speed test */
+    S_SPEEDTEST_RUNNING,
+    S_SPEEDTEST_RESULT,   /* dialog body: "Download: %.1f Mbps\nUpload: %.1f Mbps" */
+    S_SPEEDTEST_FAIL,
+    S_SPEEDTEST_SUB,      /* live-view subtitle */
+    S_SPEEDTEST_DOWNLOAD, /* live-view row label */
+    S_SPEEDTEST_UPLOAD,   /* live-view row label */
+    S_SPEEDTEST_CANCEL_HINT, /* footer hint while the test runs */
+    S_RESET_DEFAULTS,
+    S_RESET_DEFAULTS_CONFIRM,
+    S_RESET_DONE,
+
+    /* Storage detail dialog (A on the SD-card row). */
+    S_STORAGE_TITLE,
+    S_STORAGE_DETAIL,     /* "%s free of %s\nDownloads: %s\nCache: %s" */
+
+    /* About: re-runnable onboarding entry. */
+    S_GETTING_STARTED,
 
     S__COUNT
 };
