@@ -7,6 +7,19 @@ Notes for each release. `release.sh` pulls the section matching the version in
 `VERSION` and attaches it to the GitHub release. Add a `## <version>` section
 here before running a release.
 
+## 1.1.1
+
+**Speed-test reliability on slower connections.**
+
+- The Diagnostics **speed test** now transfers a **50 MB** download sample
+  instead of 90 MB. The larger sample made no measurable difference to the
+  reading but pushed the minimum link speed that could finish inside the test's
+  time limit up to ~6 Mbps — so a genuinely slow-but-working connection could
+  time out and report a spurious failure. 50 MB drops that floor back to
+  ~3.3 Mbps while still running long enough to measure accurately.
+- Documentation: the README now calls out **custom install folders** (global
+  and per-console), with a link to the new Custom Folders wiki page.
+
 ## 1.1.0
 
 **A redesigned Settings, per-console install folders, a live speed test, and a

@@ -314,15 +314,15 @@ static int speed_xfer(void *ud, curl_off_t dltotal, curl_off_t dlnow,
 /* Payloads are sized so the transfer runs long enough for TLS/TCP to ramp up
  * and settle into a steady rate before it ends — a short transfer finishes
  * during the ramp and reads far too low. On typical Switch Wi-Fi (~10-100 Mbps)
- * 90 MB down / 40 MB up gives a ~15-30 s measurement. The 120 s per-phase
- * timeout below keeps the same slow-link floor as before (~7 Mbps still
- * completes the larger payload in time).
+ * 50 MB down / 40 MB up gives a ~10-20 s measurement. Bigger payloads made no
+ * measurable difference to the reading, so 50 MB keeps the 120 s per-phase
+ * timeout well clear even on slow links (~3.3 Mbps still finishes in time).
  *
- * The download size is capped by Cloudflare: __down?bytes=N returns 403 once N
- * reaches 100000000 (100 MB), which — with FAILONERROR on — surfaces as a failed
- * speed test. 90 MB stays clear of that ceiling. The upload has no such limit:
- * __up swallows a POST body we generate ourselves, so its size is our choice. */
-#define SPEEDTEST_DL_URL   "https://speed.cloudflare.com/__down?bytes=90000000"
+ * The download size is also capped by Cloudflare: __down?bytes=N returns 403
+ * once N reaches 100000000 (100 MB), which — with FAILONERROR on — surfaces as a
+ * failed speed test. 50 MB stays well under that ceiling. The upload has no such
+ * limit: __up swallows a POST body we generate ourselves, so its size is ours. */
+#define SPEEDTEST_DL_URL   "https://speed.cloudflare.com/__down?bytes=50000000"
 #define SPEEDTEST_UP_URL   "https://speed.cloudflare.com/__up"
 #define SPEEDTEST_UP_BYTES 40000000ULL
 #define SPEEDTEST_TIMEOUT  120L   /* per-phase cap, seconds */

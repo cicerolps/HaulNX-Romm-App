@@ -84,8 +84,18 @@ everything you download from then on just appears.
 - Either way the build is validated and staged, so an interrupted install can't
   corrupt the app
 
+**Custom install folders**
+- The whole library lives at `sdmc:/roms/<console>/` by default, but you can
+  **move it anywhere** (Settings → Storage → ROM Download Folder) or send
+  **individual consoles to their own folders** while the rest stay put
+  (Settings → Storage → Install folders → *Custom per console*). Handy when one
+  emulator insists on its own directory or you keep a system on a separate card.
+  Full walkthrough on the
+  **[Custom Folders](https://github.com/digdat0/HaulNX/wiki/Reference-Custom-Folders)**
+  wiki page.
+
 **Also** — an optional card view, full touch control, 25 languages, light and dark
-themes, a live network/space/battery header, and a configurable ROM folder.
+themes, and a live network/space/battery header.
 **Settings → Manage data** refreshes or clears cached metadata, cleans up the
 temporary downloads folder, and takes a collection sent over Wi-Fi from the
 [App Utility](#collections-config--the-app-utility).
