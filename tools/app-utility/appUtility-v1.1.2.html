@@ -181,7 +181,7 @@
 </header>
 
 <div class="modal" id="sendModal">
-  <div class="sheet" style="max-width:520px">
+  <div class="sheet" style="width:800px">
     <div class="sheet-hd">
       <div class="hd-row">
         <b>Switch transfer</b>
@@ -192,6 +192,7 @@
       <div class="tabs" style="margin-top:14px">
         <button id="sendTabExport" class="sm act">Export collection</button>
         <button id="sendTabImport" class="sm">Import collection</button>
+        <button id="sendTabRom" class="sm">Send a game</button>
         <button id="sendTabNro" class="sm">App update (.nro)</button>
       </div>
       <div class="row">
@@ -216,6 +217,18 @@
           this editor, so you can edit it and send it back. Open the same
           <b>Import collection</b> screen on the Switch for the address, then hit
           <b>Get from Switch</b>.</div>
+      </div>
+      <div id="sendPaneRom" style="display:none">
+        <div class="row" style="margin-top:10px">
+          <input id="romFile" type="file" class="grow">
+        </div>
+        <div class="hint">Pushes a game file into a console's installed folder —
+          handy for a ROM you already have on your PC. On the Switch, open the
+          <b>Installed</b> tab, highlight the console, press <b>Y</b> for its ROM
+          folder, and choose <b>Receive from PC</b> — it shows the address to
+          type above. It goes into whichever console you opened that screen from,
+          so pick the right one there; then hit <b>Send</b> and confirm on the
+          Switch if it would replace a file already there.</div>
       </div>
       <div id="sendPaneNro" style="display:none">
         <div class="row" style="margin-top:10px">
@@ -512,15 +525,17 @@ function renderCards(){
       undefined,{sensitivity:"base",numeric:true}))
     .forEach(({g,gi})=>{
       const live = g.repos.filter(r=>r.active).length;
-      const c = el("div","card"+(g.shown?"":" hidden-group"));
+      const vis = visState(g);
+      const c = el("div","card"+(vis==="hidden"?" hidden-group":""));
       const full = consoleFullName(g.console);
       c.innerHTML = `
-        <div class="card-title">${esc(g.console||"(no console)")}</div>
+        <div class="card-title">${esc(g.console||"(no console)")}${g.pinned?' <span class="tag on">pinned</span>':""}</div>
         ${full?`<div class="card-sub">${esc(full)}</div>`:""}
         <div class="card-foot">
           <span class="pill">${g.repos.length} repo${g.repos.length===1?"":"s"}</span>
           <span class="tag ${live?"on":"off"}">${live} active</span>
-          ${g.shown?"":'<span class="tag off">hidden</span>'}
+          <span class="tag ${vis==="hidden"?"off":"on"}">${esc(VIS_LABEL[vis])}</span>
+          ${g.folder?'<span class="tag on">custom folder</span>':""}
         </div>`;
       c.onclick = ()=>{ openGroup=gi; renderGroups(); window.scrollTo({top:0,behavior:"smooth"}); };
       grid.appendChild(c);
@@ -531,6 +546,23 @@ function renderCards(){
   add.onclick = ()=>$("#btnAddGroup").click();
   grid.appendChild(add);
   box.appendChild(grid);
+}
+
+// Two booleans (shown = Browse, shown_installed = Installed) collapse to one of
+// four states the app exposes. Keep this in sync with config.c's shown /
+// shown_installed handling.
+function visState(g){
+  const b=g.shown!==false, i=g.shown_installed!==false;
+  return b&&i?"both":b?"browse":i?"installed":"hidden";
+}
+const VIS_LABEL={both:"Browse + Installed",browse:"Browse only",installed:"Installed only",hidden:"Hidden"};
+function visOptions(cur){
+  return Object.keys(VIS_LABEL).map(v=>
+    `<option value="${v}"${v===cur?" selected":""}>${VIS_LABEL[v]}</option>`).join("");
+}
+function applyVis(g,v){
+  g.shown = (v==="both"||v==="browse");
+  g.shown_installed = (v==="both"||v==="installed");
 }
 
 function renderDetail(gi){
@@ -545,9 +577,20 @@ function renderDetail(gi){
     <select data-g="${gi}" data-f="console" title="Console">${consoleOptions(g.console)}</select>
     <input data-g="${gi}" data-f="target" value="${esc(g.target)}"
       title="Target folder under sdmc:/roms/" placeholder="target folder">
-    <label class="chk"><input type="checkbox" data-g="${gi}" data-f="shown" ${g.shown?"checked":""}> shown</label>
+    <label class="chk" title="Which tabs this console appears on in the app">shows on
+      <select data-g="${gi}" data-f="visibility">${visOptions(visState(g))}</select></label>
+    <label class="chk"><input type="checkbox" data-g="${gi}" data-f="pinned" ${g.pinned?"checked":""}> pinned</label>
     <button class="sm" data-add-repo="${gi}">+ repo</button>
     <button class="sm danger" data-del-group="${gi}">Delete group</button>`;
+
+  // Custom install folder: blank keeps the app default (sdmc:/roms/<target>).
+  const meta = el("div","repo");
+  meta.style.marginBottom="10px";
+  meta.innerHTML = `<label class="fld">Custom install folder
+      <span style="font-weight:400;opacity:.7">— blank = default <code>sdmc:/roms/${esc(g.target||"…")}</code></span></label>
+    <input data-g="${gi}" data-f="folder" value="${esc(g.folder||"")}"
+      placeholder="leave blank for the default location, or e.g. sdmc:/roms/${esc(g.target||"")}">`;
+  box.appendChild(meta);
 
   const rs = el("div","repos");
   if(!g.repos.length) rs.innerHTML='<div class="empty" style="padding:12px">No repos in this console.</div>';
@@ -585,6 +628,7 @@ function onEditInput(e){
   const t=e.target, gi=t.dataset.g, ri=t.dataset.r, f=t.dataset.f;
   if(gi==null||!f) return;
   const val = t.type==="checkbox" ? t.checked : t.value;
+  if(f==="visibility"){ applyVis(state.groups[+gi], val); return; }  // → shown + shown_installed
   if(ri==null) state.groups[+gi][f]=val;   // keep target as-is when console changes
   else state.groups[+gi].repos[+ri][f]=val;
 }
@@ -609,7 +653,7 @@ function onEditClick(e){
 });
 
 $("#btnAddGroup").onclick=()=>{ const c=state.tico[0]||"";
-  state.groups.push({console:c,target:c,shown:true,repos:[]});
+  state.groups.push({console:c,target:c,shown:true,shown_installed:true,pinned:false,folder:"",repos:[]});
   openGroup = state.groups.length - 1;   // drop straight into the new group
   render();
 };
@@ -716,8 +760,13 @@ function loadModel(obj){
     gs.forEach(g=>{
       const target = g.target||g.console||"";
       const console_ = g.console||g.target||"";
+      // Preserve every group-level field the app writes. shown/shown_installed
+      // default to true when absent (matching the app's own parse), so an old
+      // file without them round-trips to "visible on both tabs", not hidden.
       state.groups.push({
-        console:console_, target, shown: g.shown!==false,
+        console:console_, target,
+        shown: g.shown!==false, shown_installed: g.shown_installed!==false,
+        pinned: !!g.pinned, folder: g.folder||"",
         repos:(Array.isArray(g.repos)?g.repos:[]).map(r=>({
           label:r.label||"", a_id:r.a_id||"", URL:r.URL||"",
           active:r.active!==false, pinned:!!r.pinned }))
@@ -729,11 +778,18 @@ function loadModel(obj){
 }
 function buildJson(){
   return {
-    console_list_groups: state.groups.map(g=>({
-      console:g.console, target:g.target||g.console, shown:!!g.shown,
-      repos:g.repos.map(r=>({label:r.label||r.a_id, a_id:r.a_id, URL:r.URL||"",
-        active:!!r.active, pinned:!!r.pinned}))
-    })),
+    console_list_groups: state.groups.map(g=>{
+      const o={
+        console:g.console, target:g.target||g.console,
+        shown:!!g.shown, shown_installed:g.shown_installed!==false,
+        pinned:!!g.pinned,
+        repos:g.repos.map(r=>({label:r.label||r.a_id, a_id:r.a_id, URL:r.URL||"",
+          active:!!r.active, pinned:!!r.pinned}))
+      };
+      // Match the app: only emit "folder" when a custom path is set.
+      if(g.folder) o.folder=g.folder;
+      return o;
+    }),
     consoles: state.tico.slice()
   };
 }
@@ -823,15 +879,17 @@ $("#sendIp").addEventListener("input",()=>{
 // pull the one the console is running (Import), or push a built .nro to install
 // (for testing new builds without a USB cable). Same receiver on the Switch
 // either way — it tells them apart by content.
-function sendTab(which){ // "export" | "import" | "nro"
+function sendTab(which){ // "export" | "import" | "rom" | "nro"
   $("#sendTabExport").classList.toggle("act",which==="export");
   $("#sendTabImport").classList.toggle("act",which==="import");
+  $("#sendTabRom").classList.toggle("act",which==="rom");
   $("#sendTabNro").classList.toggle("act",which==="nro");
   $("#sendPaneExport").style.display = which==="export"?"":"none";
   $("#sendPaneImport").style.display = which==="import"?"":"none";
+  $("#sendPaneRom").style.display    = which==="rom"?"":"none";
   $("#sendPaneNro").style.display    = which==="nro"?"":"none";
   // Import is the only pull: it uses its own Get button as the action; the
-  // other two push, so they use Send.
+  // others push, so they use Send.
   const imp = which==="import";
   $("#sendGet").style.display = imp?"":"none";
   $("#sendGet").classList.toggle("primary",imp);
@@ -840,6 +898,7 @@ function sendTab(which){ // "export" | "import" | "nro"
 }
 $("#sendTabExport").onclick=()=>sendTab("export");
 $("#sendTabImport").onclick=()=>sendTab("import");
+$("#sendTabRom").onclick=()=>sendTab("rom");
 $("#sendTabNro").onclick=()=>sendTab("nro");
 
 // The three fields, read back as the one URL both directions hang off:
@@ -905,8 +964,20 @@ $("#sendGo").onclick=async()=>{
   if(!base) return;
 
   const nroTab = $("#sendTabNro").classList.contains("act");
-  let body, what;
-  if(nroTab){
+  const romTab = $("#sendTabRom").classList.contains("act");
+  let body, what, rawName=null;
+  if(romTab){
+    const f = $("#romFile").files[0];
+    if(!f){
+      $("#sendMsg").innerHTML='<div class="warn">Choose the game file to send first.</div>';
+      return;
+    }
+    // Raw body, filename in a header: the receiver streams it straight to the
+    // card (a game can be gigabytes), so it isn't wrapped in a multipart form.
+    // That makes it a non-simple cross-origin request; the receiver answers the
+    // preflight so it isn't blocked.
+    body = f; what = "copy"; rawName = f.name;
+  }else if(nroTab){
     const f = $("#nroFile").files[0];
     if(!f){
       $("#sendMsg").innerHTML='<div class="warn">Choose the .nro to send first.</div>';
@@ -939,6 +1010,7 @@ $("#sendGo").onclick=async()=>{
     const res=await new Promise((resolve,reject)=>{
       const x=new XMLHttpRequest();
       x.open("POST",base);
+      if(rawName) x.setRequestHeader("X-Filename",encodeURIComponent(rawName));
       x.upload.onprogress=e=>{ if(e.lengthComputable)
         $("#sendMsg").textContent="Sending… "+Math.round(e.loaded*100/e.total)+"%"; };
       x.onload=()=>resolve({ok:x.status>=200&&x.status<400,status:x.status});
@@ -951,7 +1023,7 @@ $("#sendGo").onclick=async()=>{
       // one-time code is missing or stale (it changes every time the receive
       // screen opens).
       $("#sendMsg").innerHTML='<div class="warn">The Switch refused it (HTTP '+res.status+
-        (res.status===413?" — the file is over the 16 MB limit":
+        (res.status===413?(romTab?" — the file is larger than the receiver allows":" — the file is over the 16 MB limit"):
          res.status===403?" — paste the full address currently shown on the Switch, including the code after the /":"")+
         ").</div>";
       return;

@@ -3,6 +3,7 @@
 
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdio.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -16,11 +17,21 @@ extern "C" {
  *
  * The received file is either a dl_sources.json collection or a HaulNX .nro
  * build to install; the server is a plain transport and the caller tells them
- * apart (an NRO carries "NRO0" at offset 0x10). */
+ * apart (an NRO carries "NRO0" at offset 0x10).
+ *
+ * The one exception is ROM mode (HTTPSRV_MODE_ROM): a game file can be hundreds
+ * of MB to several GB, far too large to hold in RAM, so it is streamed straight
+ * to a file under a caller-set folder rather than buffered into s->body. */
 
 #define HTTPSRV_PORT     8080
-/* Big enough for an app build, small enough to refuse runaway uploads. */
+/* Buffered-in-RAM modes (collection/nro): big enough for an app build, small
+ * enough to refuse runaway uploads. ROM mode streams to disk and is bounded by
+ * HTTPSRV_MAX_ROM (and, ultimately, free space on the card) instead. */
 #define HTTPSRV_MAX_BODY (16 * 1024 * 1024)
+/* A single game file. exFAT-formatted cards go past 4 GB, so this is a sanity
+ * ceiling on the declared Content-Length, not a real expected size; the card
+ * filling up is the true limit and surfaces as a write failure mid-stream. */
+#define HTTPSRV_MAX_ROM  (64ULL * 1024 * 1024 * 1024)
 /* One-time code carried in the URL path (e.g. http://ip:8080/k7m2xq9r). It only
  * ever appears on the console's screen, so anything that knows it was shown
  * the address by the user — a web page loaded on some other LAN device can
@@ -42,6 +53,7 @@ typedef enum {
     HTTPSRV_MODE_IMPORT = 0, /* receive a collection from a PC (upload page) */
     HTTPSRV_MODE_EXPORT,     /* hand this console's collection to a PC (GET) */
     HTTPSRV_MODE_NRO,        /* receive an app .nro build (update page) */
+    HTTPSRV_MODE_ROM,        /* receive a game file, streamed into dest_dir */
 } HttpSrvMode;
 
 typedef struct {
@@ -62,6 +74,18 @@ typedef struct {
     unsigned long long conn_start_ns; /* accept time, for the head deadline */
     char *body;      /* received file, NUL-terminated, owned; NULL until then */
     size_t body_len;
+    /* ROM mode only. dest_dir is set by the caller before serving; an upload is
+     * streamed to <dest_dir>/<recv_name>.part (part_path) rather than into body.
+     * On completion httpsrv_poll returns 1 with body == NULL, part_path holding
+     * the finished temp file and recv_name the sanitized name it should take —
+     * the caller confirms any overwrite and moves it into place. sink is the
+     * open temp file mid-transfer (closed and removed by httpsrv_close if the
+     * user backs out before it finishes). */
+    char dest_dir[768];
+    FILE *sink;
+    char part_path[1088];
+    char recv_name[256];
+    char last_err[64]; /* why a ROM stream aborted, for the caller to log */
 } HttpSrv;
 
 /* The console's LAN address as a dotted quad, e.g. "192.168.1.42".
@@ -79,6 +103,9 @@ bool httpsrv_open(HttpSrv *s);
  *   2  the browser fetched the post-upload page, so it is parked somewhere a
  *      reload is harmless and the caller can stop serving
  *   3  the current config was handed to the browser (an export)
+ *   4  a ROM stream aborted mid-transfer (card full, or the peer dropped);
+ *      s->last_err holds a short reason and the server is left listening for a
+ *      retry unless the caller stops it
  *  -1  the server is not open
  * Once this returns 1 the caller owns s->body until httpsrv_close. */
 int httpsrv_poll(HttpSrv *s);

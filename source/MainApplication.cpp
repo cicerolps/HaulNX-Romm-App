@@ -165,7 +165,8 @@ static void load_console_icons() {
         "set-credits",
         // v2 reorganized settings hierarchy
         "set-appearance", "set-downloads", "set-sources", "set-storage",
-        "set-transfers", "set-account", "set-diagnostics", "set-logs"};
+        "set-transfers", "set-install-pc", "set-account", "set-diagnostics",
+        "set-logs"};
     for (const char *k : keys) {
         auto tex = pu::ui::render::LoadImageFromFile(std::string("romfs:/icons/") +
                                                      k + ".png");
@@ -2292,6 +2293,7 @@ MainApplication::Tab MainApplication::CurrentTab() {
     case Screen::Language:
     case Screen::Cache:
     case Screen::Transfers:
+    case Screen::RecvConsole:
     case Screen::Sources:
     case Screen::Storage:
     case Screen::InstallFolders:
@@ -2493,11 +2495,12 @@ void MainApplication::GotoSettings() {
         {S_SEC_SOURCES,     "set-sources"},     // 2
         {S_SEC_STORAGE,     "set-storage"},     // 3
         {S_SEC_TRANSFERS,   "set-transfers"},   // 4
-        {S_SEC_ACCOUNT,     "set-account"},     // 5
-        {S_SEC_UPDATES,     "set-updates"},     // 6 — carries the update chip
-        {S_SEC_LOGS,        "set-logs"},        // 7
-        {S_SEC_DIAGNOSTICS, "set-diagnostics"}, // 8
-        {S_SEC_ABOUT,       "set-credits"},     // 9
+        {S_SEC_INSTALL_PC,  "set-install-pc"},  // 5 — receive a game from a PC
+        {S_SEC_ACCOUNT,     "set-account"},     // 6
+        {S_SEC_UPDATES,     "set-updates"},     // 7 — carries the update chip
+        {S_SEC_LOGS,        "set-logs"},        // 8
+        {S_SEC_DIAGNOSTICS, "set-diagnostics"}, // 9
+        {S_SEC_ABOUT,       "set-credits"},     // 10
     };
     // The "Update available" / "Restart to update" chip rides the Updates row,
     // the section that now owns checking and installing.
@@ -2517,15 +2520,18 @@ void MainApplication::GotoSettings() {
         pu::ui::Color lbl = g_theme->row_text;
         pu::ui::Color chv = chevron_color();
         for (const auto &e : kEntries) {
+            // Same section icon the card grid uses, shown before the label so
+            // the list view matches the cards.
+            pu::sdl2::Texture ic = console_icon(e.icon);
             if (has_chip(e.str)) {
                 // Actionable chip far-right, in the same pill the list's
                 // size/status values use (pill = true), tinted affirmative
                 // green. Once a build is staged it becomes "Restart to update".
                 this->layout->AddRow2(tr(e.str), chip, lbl, onoff_color(true),
-                                      -1.0f, nullptr, "", false, true);
+                                      -1.0f, ic, "", false, true);
             } else {
                 this->layout->AddRow2(tr(e.str), CHEVRON, lbl, chv, -1.0f,
-                                      nullptr, "", false, false);
+                                      ic, "", false, false);
             }
         }
     }
@@ -2741,6 +2747,32 @@ void MainApplication::GotoTransfers() {
     this->layout->AddRow(tr(S_IMPORT_COLLECTION));  // 0 receive dl_sources.json from a PC
     this->layout->AddRow(tr(S_EXPORT_COLLECTION));  // 1 serve dl_sources.json to a PC
     this->layout->AddRow(tr(S_RESTORE_COLLECTION)); // 2 restore previous collection
+}
+
+// Install from PC: pick which console to receive a game into, then open the LAN
+// receiver for it (RomRecvStart). A game is per-console — its install folder is
+// resolved from the console picked here — so choosing the console up front is
+// the whole job of this screen. Row order is g_cfg.consoles order, so the
+// A-press in OnInput maps a row straight to a console index.
+void MainApplication::GotoRecvConsole() {
+    this->screen = Screen::RecvConsole;
+    this->layout->SetTitle(tr(S_TITLE_RECV_CONSOLE));
+    this->layout->SetSubtitle(tr(S_SUB_RECV_CONSOLE));
+    this->layout->ClearMenu();
+    if (g_cfg.console_count == 0) {
+        this->layout->AddRow(tr(S_NO_CONSOLES));
+        return;
+    }
+    pu::ui::Color lbl = g_theme->row_text;
+    for (int i = 0; i < g_cfg.console_count; i++) {
+        ConsoleGroup &c = g_cfg.consoles[i];
+        // Icon + "Full Name (SHORT)", exactly as the Installed console list
+        // renders each console, so the two stay visually consistent.
+        char clbl[160];
+        console_label(c.target, clbl, sizeof(clbl));
+        this->layout->AddRow2(clbl, CHEVRON, lbl, chevron_color(), -1.0f,
+                              console_icon(c.target), "", false, false);
+    }
 }
 
 // Sources: the catalogue you pull from. Which consoles show on Browse, the
@@ -3283,6 +3315,7 @@ void MainApplication::ImportStart(bool onboarding) {
     // where it was, so the flags must not outlive a start that never happened.
     this->imp_onboard = onboarding;
     this->imp_nro = false;
+    this->imp_rom = false;
     this->imp_prog = false;
     this->screen = Screen::Import;
 
@@ -3326,6 +3359,7 @@ void MainApplication::ExportStart() {
     this->imp_grace = 0;
     this->imp_onboard = false;
     this->imp_nro = false; // returns to Manage data, like an import
+    this->imp_rom = false;
     this->imp_prog = false;
     this->screen = Screen::Import;
 
@@ -3362,6 +3396,7 @@ void MainApplication::UpdateWifiStart() {
     this->imp_grace = 0;
     this->imp_onboard = false;
     this->imp_nro = true;
+    this->imp_rom = false;
     this->imp_prog = false;
     this->screen = Screen::Import;
 
@@ -3378,6 +3413,66 @@ void MainApplication::UpdateWifiStart() {
                                 true, tr(S_IMPORT_REPO_NOTE));
 }
 
+// ---- receive a game into a console's install folder ------------------------
+// Launched per-console from the Installed tab. Same LAN receiver as the import
+// flow, but in ROM mode: the upload streams straight to disk (a game can be
+// gigabytes) and lands in this console's folder — either the browser upload
+// page or the app utility's "Send a game" tab can push to it. The console is
+// fixed by which row opened this screen, so the sender never has to pick one.
+void MainApplication::RomRecvStart(int ci, bool fromSettings) {
+    if (ci < 0 || ci >= g_cfg.console_count) {
+        return;
+    }
+    ConsoleGroup *g = &g_cfg.consoles[ci];
+    // Resolve the install folder exactly as the queue and Installed tab do: the
+    // per-console custom folder when one is set (and the feature is on), else
+    // <roms_root>/<target>.
+    const char *custom = install_folder_for(g->target);
+    std::string dir = (custom && custom[0])
+                          ? std::string(custom)
+                          : std::string(roms_root(&g_tico)) + "/" + g->target;
+    fs_mkdir_p(dir.c_str()); // stream target must exist before the first byte
+
+    char ip[64];
+    if (!httpsrv_local_ip(ip, sizeof(ip))) {
+        this->ToastErr(tr(S_IMPORT_NO_NET));
+        return;
+    }
+    if (!httpsrv_open(&this->imp_srv)) {
+        this->ToastErr(tr(S_IMPORT_SRV_FAIL));
+        return;
+    }
+    this->imp_srv.mode = HTTPSRV_MODE_ROM;
+    snprintf(this->imp_srv.dest_dir, sizeof(this->imp_srv.dest_dir), "%s",
+             dir.c_str());
+    this->imp_open = true;
+    this->imp_grace = 0;
+    this->imp_onboard = false;
+    this->imp_nro = false;
+    this->imp_rom = true;
+    this->imp_prog = false;
+    this->imp_rom_from_settings = fromSettings;
+    this->imp_rom_ci = ci;
+    this->imp_rom_dir = dir;
+    const char *full = console_full_name(g->target);
+    this->imp_rom_label = full ? full : g->target;
+    this->screen = Screen::Import;
+
+    char url[96];
+    snprintf(url, sizeof(url), "http://%s:%d/%s", ip, HTTPSRV_PORT,
+             this->imp_srv.token);
+    xfer_log("listening  %s (rom -> %s)", url, dir.c_str());
+
+    this->layout->SetTitle(tr(S_ROM_RECV_TITLE));
+    this->layout->SetSubtitle(tr(S_SUB_IMPORT));
+    this->layout->ClearMenu();
+    char steps[512];
+    snprintf(steps, sizeof(steps), tr(S_ROM_RECV_STEPS),
+             this->imp_rom_label.c_str());
+    this->layout->SetEmptyState(g_header_logo, url, steps, true,
+                                tr(S_IMPORT_REPO_NOTE));
+}
+
 // Every way out of the import flow comes through here. A first-run import is
 // launched from the welcome dialog on Home, so landing back in Manage data
 // would strand a new user in a settings submenu instead of showing them the
@@ -3385,12 +3480,35 @@ void MainApplication::UpdateWifiStart() {
 void MainApplication::ImportReturn() {
     bool onboard = this->imp_onboard;
     bool nro = this->imp_nro;
+    bool rom = this->imp_rom;
+    bool rom_settings = this->imp_rom_from_settings;
+    int rom_ci = this->imp_rom_ci;
     this->imp_onboard = false; // one-shot: only the import it was set for
     this->imp_nro = false;
+    this->imp_rom = false;
+    this->imp_rom_from_settings = false;
+    this->imp_rom_ci = -1;
     if (onboard) {
         this->GotoHome();
     } else if (nro) {
         this->GotoUpdates(); // update-over-Wi-Fi lives under Updates now
+    } else if (rom && rom_settings) {
+        // Launched from Settings › Install from PC: return to that console
+        // picker so the user can send to another console or step back out.
+        this->GotoRecvConsole();
+    } else if (rom) {
+        // Back to the Installed console list, reselecting the console the
+        // receiver was opened for so the user lands where they started.
+        std::string nm = (rom_ci >= 0 && rom_ci < g_cfg.console_count)
+                             ? std::string(g_cfg.consoles[rom_ci].target)
+                             : "";
+        this->GotoInstalled(roms_root(&g_tico));
+        for (s32 k = 0; !nm.empty() && k < (s32)g_inst.size(); k++) {
+            if (g_inst[k].name == nm) {
+                this->layout->SetSel(k);
+                break;
+            }
+        }
     } else {
         this->GotoTransfers();
     }
@@ -3430,7 +3548,26 @@ void MainApplication::ImportTick() {
         this->ImportApply();
         return;
     }
-    if (this->ImportPoll() == 1) {
+    int r = this->ImportPoll();
+    if (r == 4) {
+        // A ROM stream broke mid-transfer (card full, or the sender dropped).
+        // The partial file is already gone; tell the user why and leave the
+        // receiver, so they can just send again from the same address.
+        xfer_log("rom        transfer aborted: %s", this->imp_srv.last_err);
+        this->ToastErr(tr(S_ROM_RECV_FAIL));
+        this->imp_prog = false;
+        this->layout->SetSubtitle(tr(S_SUB_IMPORT));
+        return;
+    }
+    if (r == 1) {
+        // A ROM streams straight to disk and its upload gets a plain 200 (no
+        // /sent redirect to serve), so apply at once rather than idling out the
+        // grace window — which also frees the receiver before another connection
+        // could land and clobber the just-received filename.
+        if (this->imp_rom) {
+            this->ImportApply();
+            return;
+        }
         this->imp_grace = IMPORT_GRACE_FRAMES;
         return;
     }
@@ -3452,6 +3589,49 @@ void MainApplication::ImportTick() {
 }
 
 void MainApplication::ImportApply() {
+    // A ROM streamed straight to disk: nothing is in s->body. Take the finished
+    // ".part" and its name, stop listening, then confirm any overwrite and swap
+    // it into place. Writing to ".part" first means a failed transfer never
+    // corrupts a file already there.
+    if (this->imp_rom) {
+        std::string name = this->imp_srv.recv_name;
+        std::string part = this->imp_srv.part_path;
+        std::string dir = this->imp_rom_dir;
+        this->imp_grace = 0;
+        this->ImportStop(); // closes the socket; the finished .part stays on disk
+        if (name.empty() || part.empty() || !fs_exists(part.c_str())) {
+            // The transfer never completed (backed out, or it failed and the
+            // partial was already cleaned up). Nothing to save.
+            this->ImportReturn();
+            return;
+        }
+        std::string dest = dir + "/" + name;
+        if (fs_exists(dest.c_str())) {
+            char msg[512];
+            snprintf(msg, sizeof(msg), tr(S_ROM_RECV_CONFIRM), name.c_str());
+            if (!this->ConfirmDanger(tr(S_ROM_RECV_TITLE), msg)) {
+                remove(part.c_str());
+                xfer_log("rom        %s not replaced (declined)", name.c_str());
+                this->ImportReturn();
+                return;
+            }
+        }
+        if (!fs_move(part.c_str(), dest.c_str())) {
+            remove(part.c_str());
+            xfer_log("rom        FAILED to save %s into %s", name.c_str(),
+                     dir.c_str());
+            this->ToastErr(tr(S_ROM_RECV_FAIL));
+            this->ImportReturn();
+            return;
+        }
+        xfer_log("rom        saved %s into %s", name.c_str(), dir.c_str());
+        char done[256];
+        snprintf(done, sizeof(done), tr(S_ROM_RECV_DONE), name.c_str());
+        this->Toast(done);
+        this->ImportReturn();
+        return;
+    }
+
     // Take the file and stop listening: the import is a one-shot, and the
     // confirm dialog must not run with a live socket behind it.
     char *body = this->imp_srv.body;
@@ -4418,6 +4598,24 @@ static bool inst_is_console_root(const std::string &path) {
     std::string parent = (pp == std::string::npos) ? path : path.substr(0, pp);
     if (parent == root) return true;
     return console_by_custom_folder(path) != nullptr;
+}
+
+// Open the Installed browser's sort picker and apply the choice, keeping the
+// cursor where it was. Shared by the root console list's options menu (X) and
+// the in-folder ◀ shortcut so both offer the same sort regardless of view.
+void MainApplication::InstSortDialog() {
+    int s = this->CreateShowDialog(
+        tr(g_sort_keys[g_inst_sort]), "",
+        {tr(S_SORT_DEFAULT), tr(S_SORT_NAME_AZ), tr(S_SORT_NAME_ZA),
+         tr(S_SORT_SIZE_DESC), tr(S_SORT_SIZE_ASC), tr(S_CANCEL)},
+        false, {}, style_dialog);
+    if (s >= 0 && s < SORT__COUNT) {
+        g_inst_sort = s;
+        s32 keep = this->layout->Sel();
+        this->GotoInstalled(this->inst_path);
+        if (keep >= 0 && keep < this->layout->RowCount())
+            this->layout->SetSel(keep);
+    }
 }
 
 void MainApplication::GotoInstalled(const std::string &path) {
@@ -5448,6 +5646,15 @@ void MainApplication::HandleInput(u64 down, u64 held,
                 snprintf(c0, sizeof(c0), "%s / %s",
                          human_size(it->now).c_str(),
                          human_size(it->total).c_str());
+            } else if (it->status == Q_VERIFYING) {
+                // A big uncompressed ISO has no unzip step to follow, so its
+                // md5 pass is the only "processing" the user waits on. Show the
+                // same byte-based bar (hashed / total) so it can't look hung.
+                if (it->total) {
+                    prog = (float)it->now / (float)it->total;
+                    snprintf(c0, sizeof(c0), "%s",
+                             human_size(it->total).c_str());
+                }
             } else if (it->status == Q_EXTRACTING) {
                 if (it->total) {
                     prog = (float)it->now / (float)it->total;
@@ -5502,6 +5709,7 @@ void MainApplication::HandleInput(u64 down, u64 held,
                                        st, sc, c0, c1, c2,
                                        it->name, prog,
                                        it->status == Q_DOWNLOADING ||
+                                           it->status == Q_VERIFYING ||
                                            it->status == Q_EXTRACTING,
                                        ring, qpos, qrefresh);
         }
@@ -5553,6 +5761,15 @@ void MainApplication::HandleInput(u64 down, u64 held,
                 snprintf(info, sizeof(info), "%s / %s",
                          human_size(it->now).c_str(),
                          human_size(it->total).c_str());
+            } else if (it->status == Q_VERIFYING) {
+                // Uncompressed files skip the unzip phase, so verify is the
+                // whole wait: give it the same moving bar (bytes hashed / size)
+                // rather than a static "vrfy" that reads as a hang.
+                if (it->total) {
+                    prog = (float)it->now / (float)it->total;
+                    snprintf(info, sizeof(info), "%s",
+                             human_size(it->total).c_str());
+                }
             } else if (it->status == Q_EXTRACTING) {
                 // Bar shows progress from archive bytes consumed; text shows
                 // just the count of entries finished so far (no percent). This
@@ -5611,9 +5828,10 @@ void MainApplication::HandleInput(u64 down, u64 held,
                 prog = 1.0f;
                 bar = 2;
             }
-            // The actively-worked item (downloading or unzipping) is the
-            // "hero" row: accent background, thicker bar, shimmer.
+            // The actively-worked item (downloading, verifying or unzipping)
+            // is the "hero" row: accent background, thicker bar, shimmer.
             bool accent = (it->status == Q_DOWNLOADING ||
+                           it->status == Q_VERIFYING ||
                            it->status == Q_EXTRACTING);
             this->layout->AddRow2(left, info, c, rc, prog,
                                   console_icon(it->target), pfx, accent,
@@ -6058,11 +6276,12 @@ void MainApplication::HandleInput(u64 down, u64 held,
             case 2: this->GotoSources();     return;
             case 3: this->GotoStorage();     return;
             case 4: this->GotoTransfers();   return;
-            case 5: this->GotoAccount();     return;
-            case 6: this->GotoUpdates();     return;
-            case 7: this->GotoViewLogs();    return;
-            case 8: this->GotoDiagnostics(); return;
-            case 9: this->GotoAbout();       return;
+            case 5: this->GotoRecvConsole(); return;
+            case 6: this->GotoAccount();     return;
+            case 7: this->GotoUpdates();     return;
+            case 8: this->GotoViewLogs();    return;
+            case 9: this->GotoDiagnostics(); return;
+            case 10: this->GotoAbout();      return;
             default: break;
             }
         }
@@ -6154,8 +6373,30 @@ void MainApplication::HandleInput(u64 down, u64 held,
                                 : tr(S_ROMS_OVERRIDE_CLEARED));
             this->GotoStorage(); // ROM folder lives under Storage now
         };
+        // Where to land after finishing (or backing out of) a per-console pick:
+        // the Installed tab when the picker was opened from there, otherwise the
+        // Storage per-console folder list. Reselects the edited console either
+        // way. Clears the from-Installed flag so it can't leak into a later pick.
+        auto return_from_console = [&](int ci) {
+            bool from_inst = this->picker_from_installed;
+            std::string nm = g_cfg.consoles[ci].target;
+            this->picker_console = -1;
+            this->picker_from_installed = false;
+            if (from_inst) {
+                this->GotoInstalled(roms_root(&g_tico));
+                for (s32 k = 0; k < (s32)g_inst.size(); k++) {
+                    if (g_inst[k].name == nm) {
+                        this->layout->SetSel(k);
+                        break;
+                    }
+                }
+            } else {
+                this->GotoInstallFolders();
+                this->layout->SetSel(ci); // keep the cursor on the edited console
+            }
+        };
         // Set (or, with chosen=="", clear) this console's custom install folder,
-        // then return to the per-console folder list.
+        // then return to wherever the pick was launched from.
         auto apply_console = [&](const char *chosen) {
             char norm[512];
             roms_normalize_path(chosen, norm, sizeof(norm));
@@ -6165,18 +6406,13 @@ void MainApplication::HandleInput(u64 down, u64 held,
             config_save(&g_cfg);
             this->Toast(norm[0] ? tr(S_INSTALL_FOLDER_SET)
                                 : tr(S_INSTALL_FOLDER_CLEARED));
-            this->picker_console = -1;
-            this->GotoInstallFolders();
-            this->layout->SetSel(ci); // keep the cursor on the edited console
+            return_from_console(ci);
         };
         bool at_root = (this->picker_path == "sdmc:/");
         if (down & HidNpadButton_B) {
             if (at_root) {
                 if (per_console) {
-                    int ci = this->picker_console;
-                    this->picker_console = -1;
-                    this->GotoInstallFolders();
-                    this->layout->SetSel(ci);
+                    return_from_console(this->picker_console);
                 } else {
                     this->GotoStorage();
                 }
@@ -6358,6 +6594,21 @@ void MainApplication::HandleInput(u64 down, u64 held,
         break;
     }
 
+    case Screen::RecvConsole: {
+        if (down & HidNpadButton_B) {
+            this->GotoSettings();
+        } else if (down & HidNpadButton_A) {
+            // Rows are g_cfg.consoles in order, so the selection is the console
+            // index. (An empty list shows a single "no consoles" row that maps
+            // to no console and does nothing.)
+            s32 i = this->layout->Sel();
+            if (g_cfg.console_count > 0 && i >= 0 && i < g_cfg.console_count) {
+                this->RomRecvStart((int)i, true);
+            }
+        }
+        break;
+    }
+
     case Screen::Sources: {
         if (down & HidNpadButton_B) {
             this->GotoSettings();
@@ -6384,6 +6635,7 @@ void MainApplication::HandleInput(u64 down, u64 held,
                     start = g_prefs.roms_override;
                 }
                 this->picker_console = -1; // picking the ROM root, not a console
+                this->picker_from_installed = false;
                 this->GotoRomPicker(start);
                 return;
             }
@@ -6439,6 +6691,7 @@ void MainApplication::HandleInput(u64 down, u64 held,
             // custom folder if it still exists, else the SD root.
             int ci = this->layout->Sel();
             this->picker_console = ci;
+            this->picker_from_installed = false;
             std::string start = "sdmc:/";
             const char *f = g_cfg.consoles[ci].folder;
             if (f[0] && fs_exists(f)) start = f;
@@ -6933,21 +7186,32 @@ void MainApplication::HandleInput(u64 down, u64 held,
                     this->MvStart(targets);
                 }
             }
-        } else if ((down & HidNpadButton_Y) && !in_cards &&
-                   this->inst_path != roms_root(&g_tico)) {
-            // Y marks roms for deletion — only inside a console folder, never
-            // on the console list where selecting/deleting makes no sense.
+        } else if ((down & HidNpadButton_X) &&
+                   this->inst_path == roms_root(&g_tico)) {
+            // Root console list: X opens the per-console options for the console
+            // under the cursor. Everything that isn't "open" (A) or "install
+            // folder" (Y) lives here — receive a game from a PC, pin/unpin, and
+            // sort — so the same actions are available whether the list or the
+            // card grid is showing. The card grid needs the D-pad for
+            // navigation, so these can't hang off ◀/▶ the way they once did.
             s32 i = this->layout->Sel();
-            if (i >= 0 && i < (s32)g_inst.size()) {
-                this->layout->ToggleMark(i);
-            }
-        } else if ((in_cards ? (down & HidNpadButton_X) != 0
-                             : (down & HidNpadButton_Right) != 0)) {
-            s32 i = this->layout->Sel();
-            if (this->inst_path == roms_root(&g_tico)) {
-                // Pin/unpin a top-level console folder — D-pad Right in the
-                // list, X in the card grid (where the D-pad navigates).
-                if (i >= 0 && i < (s32)g_inst.size() && g_inst[i].is_dir) {
+            if (i >= 0 && i < (s32)g_inst.size() && g_inst[i].is_dir) {
+                ConsoleGroup *g =
+                    config_find_console(&g_cfg, g_inst[i].name.c_str());
+                const char *full = g ? console_full_name(g->target) : nullptr;
+                std::string title = full ? full : g_inst[i].name;
+                bool pinned =
+                    prefs_dir_pinned(&g_prefs, g_inst[i].name.c_str());
+                int r = this->CreateShowDialog(
+                    title, "",
+                    {tr(S_RECEIVE_FROM_PC), pinned ? tr(S_UNPIN) : tr(S_PIN),
+                     tr(S_SORT_MENU), tr(S_CANCEL)},
+                    false, {}, style_dialog);
+                if (r == 0) { // Receive from PC
+                    if (g) {
+                        this->RomRecvStart((int)(g - g_cfg.consoles));
+                    }
+                } else if (r == 1) { // Pin / Unpin
                     prefs_dir_pin_toggle(&g_prefs, g_inst[i].name.c_str());
                     prefs_save(&g_prefs);
                     std::string nm = g_inst[i].name;
@@ -6958,58 +7222,135 @@ void MainApplication::HandleInput(u64 down, u64 held,
                             break;
                         }
                     }
+                } else if (r == 2) { // Sort…
+                    this->InstSortDialog();
                 }
-            } else {
-                // Inside a console folder: ▶ deletes roms. With items marked
-                // (Y) it deletes the whole selection; with nothing marked it
-                // deletes the one under the cursor. Either way a confirm guards
-                // it, so a stray press can't wipe anything unattended.
-                int mc = this->layout->MarkedCount();
-                if (mc > 0) {
-                    char msg[64];
-                    snprintf(msg, sizeof(msg), tr(S_DELETE_SELECTED), mc);
-                    if (this->ConfirmDanger(tr(S_DELETE), msg, true)) {
-                        // Delete in reverse order so indices stay valid.
-                        auto marks = this->layout->Marked();
-                        for (auto it = marks.rbegin(); it != marks.rend(); ++it) {
-                            s32 idx = *it;
-                            if (idx >= 0 && idx < (s32)g_inst.size())
-                                fs_rm_rf((this->inst_path + "/" +
-                                          g_inst[idx].name).c_str());
+            }
+        } else if ((down & HidNpadButton_Y) &&
+                   this->inst_path == roms_root(&g_tico)) {
+            // Root console list: Y opens the install-folder dialog for the
+            // console under the cursor — see where its games install and, when
+            // per-console folders are on, change or reset that folder without a
+            // detour through Settings › Storage. Receiving a game from a PC is a
+            // separate action (X), so this dialog is only about the folder.
+            // (Works in both list and card views; inside a console folder Y
+            // still marks files, below.)
+            s32 i = this->layout->Sel();
+            if (i >= 0 && i < (s32)g_inst.size() && g_inst[i].is_dir) {
+                ConsoleGroup *g =
+                    config_find_console(&g_cfg, g_inst[i].name.c_str());
+                if (g) {
+                    const char *full = console_full_name(g->target);
+                    bool cf = g_prefs.custom_folders;
+                    bool hascustom = cf && g->folder[0];
+                    std::string path =
+                        hascustom
+                            ? std::string(g->folder)
+                            : std::string(roms_root(&g_tico)) + "/" + g->target;
+                    char line[700];
+                    snprintf(line, sizeof(line), tr(S_ROM_FOLDER_INSTALLS_TO),
+                             path.c_str());
+                    std::string body = std::string(full ? full : g->target) +
+                                       "\n\n" + line + "\n" +
+                                       (hascustom ? tr(S_ROM_FOLDER_CUSTOM_TAG)
+                                                  : tr(S_ROM_FOLDER_DEFAULT_TAG));
+                    if (!cf) {
+                        body += "\n\n";
+                        body += tr(S_ROM_FOLDER_LOCKED_NOTE);
+                    }
+                    // With per-console folders off there is nothing to change —
+                    // the dialog is purely informational (where games land), so
+                    // it offers only OK. Otherwise it sets, changes, or resets
+                    // the custom folder.
+                    std::vector<std::string> btns;
+                    if (!cf) {
+                        btns = {tr(S_OK)};
+                    } else if (hascustom) {
+                        btns = {tr(S_CHANGE_FOLDER), tr(S_RESET_DEFAULT),
+                                tr(S_CANCEL)};
+                    } else {
+                        btns = {tr(S_SET_FOLDER), tr(S_CANCEL)};
+                    }
+                    int r = this->CreateShowDialog(tr(S_INSTALL_FOLDER), body,
+                                                   btns, !cf, {}, style_dialog);
+                    bool pick = cf && r == 0;  // Set/Change → open the picker
+                    bool reset = cf && hascustom && r == 1; // Reset to default
+                    if (pick) {
+                        this->picker_console = (int)(g - g_cfg.consoles);
+                        this->picker_from_installed = true;
+                        std::string start = "sdmc:/";
+                        if (g->folder[0] && fs_exists(g->folder)) {
+                            start = g->folder;
                         }
-                        char t[32];
-                        snprintf(t, sizeof(t), tr(S_DELETED_N), mc);
-                        this->Toast(t);
+                        this->GotoRomPicker(start);
+                    } else if (reset) {
+                        g->folder[0] = '\0';
+                        config_save(&g_cfg);
+                        this->Toast(tr(S_INSTALL_FOLDER_CLEARED));
+                        std::string nm = g->target;
                         this->GotoInstalled(this->inst_path);
-                    }
-                } else if (i >= 0 && i < (s32)g_inst.size()) {
-                    char msg[300];
-                    snprintf(msg, sizeof(msg), tr(S_DELETE_ONE),
-                             g_inst[i].name.c_str());
-                    if (this->ConfirmDanger(tr(S_DELETE), msg, true)) {
-                        fs_rm_rf((this->inst_path + "/" +
-                                  g_inst[i].name).c_str());
-                        char t[32];
-                        snprintf(t, sizeof(t), tr(S_DELETED_N), 1);
-                        this->Toast(t);
-                        this->GotoInstalled(this->inst_path);
+                        for (s32 k = 0; k < (s32)g_inst.size(); k++) {
+                            if (g_inst[k].name == nm) {
+                                this->layout->SetSel(k);
+                                break;
+                            }
+                        }
                     }
                 }
             }
-        } else if ((down & HidNpadButton_Left) && !in_cards) {
-            // ◀ opens the sort picker (search now lives on −).
-            int s = this->CreateShowDialog(
-                tr(g_sort_keys[g_inst_sort]), "",
-                {tr(S_SORT_DEFAULT), tr(S_SORT_NAME_AZ), tr(S_SORT_NAME_ZA),
-                 tr(S_SORT_SIZE_DESC), tr(S_SORT_SIZE_ASC), tr(S_CANCEL)},
-                false, {}, style_dialog);
-            if (s >= 0 && s < SORT__COUNT) {
-                g_inst_sort = s;
-                s32 keep = this->layout->Sel();
-                this->GotoInstalled(this->inst_path);
-                if (keep >= 0 && keep < this->layout->RowCount())
-                    this->layout->SetSel(keep);
+        } else if ((down & HidNpadButton_Y) && !in_cards &&
+                   this->inst_path != roms_root(&g_tico)) {
+            // Y marks roms for deletion — only inside a console folder, never
+            // on the console list where selecting/deleting makes no sense.
+            s32 i = this->layout->Sel();
+            if (i >= 0 && i < (s32)g_inst.size()) {
+                this->layout->ToggleMark(i);
             }
+        } else if ((down & HidNpadButton_Right) &&
+                   this->inst_path != roms_root(&g_tico)) {
+            // Inside a console folder: ▶ deletes roms. With items marked (Y) it
+            // deletes the whole selection; with nothing marked it deletes the
+            // one under the cursor. Either way a confirm guards it, so a stray
+            // press can't wipe anything unattended. (Pinning a console lives in
+            // the root list's options menu now, on X — see above.)
+            s32 i = this->layout->Sel();
+            int mc = this->layout->MarkedCount();
+            if (mc > 0) {
+                char msg[64];
+                snprintf(msg, sizeof(msg), tr(S_DELETE_SELECTED), mc);
+                if (this->ConfirmDanger(tr(S_DELETE), msg, true)) {
+                    // Delete in reverse order so indices stay valid.
+                    auto marks = this->layout->Marked();
+                    for (auto it = marks.rbegin(); it != marks.rend(); ++it) {
+                        s32 idx = *it;
+                        if (idx >= 0 && idx < (s32)g_inst.size())
+                            fs_rm_rf((this->inst_path + "/" +
+                                      g_inst[idx].name).c_str());
+                    }
+                    char t[32];
+                    snprintf(t, sizeof(t), tr(S_DELETED_N), mc);
+                    this->Toast(t);
+                    this->GotoInstalled(this->inst_path);
+                }
+            } else if (i >= 0 && i < (s32)g_inst.size()) {
+                char msg[300];
+                snprintf(msg, sizeof(msg), tr(S_DELETE_ONE),
+                         g_inst[i].name.c_str());
+                if (this->ConfirmDanger(tr(S_DELETE), msg, true)) {
+                    fs_rm_rf((this->inst_path + "/" +
+                              g_inst[i].name).c_str());
+                    char t[32];
+                    snprintf(t, sizeof(t), tr(S_DELETED_N), 1);
+                    this->Toast(t);
+                    this->GotoInstalled(this->inst_path);
+                }
+            }
+        } else if ((down & HidNpadButton_Left) && !in_cards &&
+                   this->inst_path != roms_root(&g_tico)) {
+            // ◀ opens the sort picker inside a console folder. At the root the
+            // same picker is reached from the X options menu, so it stays
+            // available in the card grid too (where ◀ navigates).
+            this->InstSortDialog();
         } else if ((down & HidNpadButton_X) && !in_cards &&
                    this->inst_path != roms_root(&g_tico)) {
             // Rename only files inside a console folder — not the console

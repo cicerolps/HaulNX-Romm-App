@@ -605,6 +605,7 @@ class MainApplication : public pu::ui::Application {
         InstSearch, // search across installed games (roms folder)
         RomPicker, // SD-card folder browser for choosing a custom ROM root
         Import,    // waiting for a dl_sources.json upload over the LAN
+        RecvConsole, // Settings' "Install from PC": pick which console to fill
         ReleaseNotes, // GitHub release list (version + date)
         ReleaseNote   // one release's notes
     };
@@ -627,6 +628,9 @@ class MainApplication : public pu::ui::Application {
     int picker_console = -1; // ROM-folder picker target: -1 = the ROM root, else
                              // the console index whose custom install folder is
                              // being chosen (returns to that console's screen)
+    bool picker_from_installed = false; // true when the per-console picker was
+                             // opened from the Installed tab (so it returns
+                             // there instead of the Storage folder list)
     Screen log_origin;       // screen to return to from the log viewer
     // Which file the shared text-log viewer is showing, and its labels.
     std::string log_view_path;
@@ -797,7 +801,18 @@ class MainApplication : public pu::ui::Application {
     int imp_grace = 0; // >0: a file is in hand, still serving the redirect
     bool imp_onboard = false; // import launched from the first-run welcome
     bool imp_nro = false; // receiver opened from Settings' update-over-Wi-Fi
+    bool imp_rom = false; // receiver opened from the Installed tab for a ROM
     bool imp_prog = false; // subtitle currently shows receive progress
+    // A ROM receive can be launched two ways: from the Installed tab (return to
+    // the console there when done) or from Settings' "Install from PC" console
+    // picker (return to that picker). This says which, so ImportReturn lands the
+    // user back where they started.
+    bool imp_rom_from_settings = false;
+    // ROM receive: which console the receiver was opened for, so completion
+    // returns to it, and the resolved folder/label for the on-screen text.
+    int imp_rom_ci = -1;
+    std::string imp_rom_dir;
+    std::string imp_rom_label;
 
   public:
     using Application::Application;
@@ -830,6 +845,7 @@ class MainApplication : public pu::ui::Application {
     void GotoQueue();
     void GotoSettings();
     void GotoInstalled(const std::string &path);
+    void InstSortDialog(); // Installed browser sort picker (shared by X / ◀)
     void GotoInstSearch(const std::string &query);
     void ISearchTick();
     void FinishInstSearch();
@@ -880,6 +896,7 @@ class MainApplication : public pu::ui::Application {
     static void SearchThread(void *arg);
     void GotoCache();
     void GotoTransfers();
+    void GotoRecvConsole(); // Settings' "Install from PC" console picker
     void GotoViewLogs();
     void GotoDebugLog();
     void GotoXferLog();
@@ -912,6 +929,10 @@ class MainApplication : public pu::ui::Application {
     void ImportStart(bool onboarding = false);
     void ExportStart(); // mirror of import: serve this console's collection to a PC
     void UpdateWifiStart(); // same receiver, update-flavored screen + page
+    // Receive a game into a console's folder. fromSettings marks the launch as
+    // coming from the Settings "Install from PC" picker (vs the Installed tab),
+    // so ImportReturn lands back at the picker rather than the Installed list.
+    void RomRecvStart(int consoleIndex, bool fromSettings = false);
     void ImportReturn(); // where the import flow lands when it ends
     void ImportTick(); // serve one request per frame while the screen is open
     int ImportPoll();  // serve one request, logging what it did

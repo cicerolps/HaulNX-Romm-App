@@ -7,6 +7,36 @@ Notes for each release. `release.sh` pulls the section matching the version in
 `VERSION` and attaches it to the GitHub release. Add a `## <version>` section
 here before running a release.
 
+## 1.1.2
+
+**Install a game straight from your PC, plus a live verify progress bar.**
+
+**Install from PC**
+- You can now push a game file from a browser on your PC straight onto the
+  console over Wi-Fi — no USB cable, no re-downloading. The console runs a small
+  upload page that streams the file directly to the SD card (in bounded slices,
+  so the UI keeps rendering and shows a progress bar even for multi-gigabyte
+  transfers).
+- Two ways in:
+  - **On the Installed tab**, press **X** on a console for an **Options** menu —
+    *Receive from PC*, *Pin/Unpin*, and *Sort*. The same menu is available in
+    both list and card view, so the controls no longer differ between the two.
+  - **Settings › Install from PC** lets you pick the target console first, then
+    opens the receive screen with on-device instructions.
+- The **Y** button on a console is now purely *Install folder* — receiving a
+  game is its own separate action, so neither is buried inside the other.
+- New Settings section icon for Install from PC.
+
+**Verify progress**
+- MD5 verification now shows a **moving progress bar** instead of sitting on
+  "vrfy". A large uncompressed ISO (which has no unzip step after it) used to
+  look hung while it hashed; the bar now tracks the hash from 0–100%.
+
+**Other**
+- Footer button hints on the Installed tab were refreshed to match the new
+  layout, and re-translated across all 24 supported languages.
+- The bundled App Utility is now **`appUtility-v1.1.2.html`**.
+
 ## 1.1.1
 
 **Speed-test reliability on slower connections.**

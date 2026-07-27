@@ -217,6 +217,17 @@ static bool ex_progress(void *ud, const char *entry, int done,
     return !it->cancel && g_run;
 }
 
+/* Progress during md5 verification: bytes hashed so far vs the file size, so a
+ * large uncompressed ISO (no extract step to follow) shows a moving bar instead
+ * of sitting on "vrfy" long enough to look hung. */
+static void md5_progress(void *ud, uint64_t done, uint64_t total) {
+    QueueItem *it = (QueueItem *)ud;
+    it->now = done;
+    if (total) {
+        it->total = total;
+    }
+}
+
 /* Append a download outcome to the history log shown in Settings. */
 static void log_download(const QueueItem *it, const char *status) {
     fs_mkdir_p(LOGS_DIR);
@@ -757,9 +768,13 @@ static void process_item(QueueItem *it) {
     }
     if (it->md5[0]) {
         it->status = Q_VERIFYING;
+        /* Reset the bar for the verify phase: it->now/it->total held the
+         * download's final bytes (100%); md5_progress refills them with
+         * hashed/total so the UI bar tracks the hash pass from zero. */
+        it->now = 0;
         char got[33];
         boost_acquire(); /* CPU-bound hash: boost only across the md5 pass */
-        bool md5ok = md5_file(tmp, got, &it->cancel);
+        bool md5ok = md5_file(tmp, got, &it->cancel, md5_progress, it);
         boost_release();
         if (!md5ok) {
             if (it->cancel) {

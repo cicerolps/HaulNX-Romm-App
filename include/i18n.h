@@ -127,6 +127,24 @@ enum {
     S_SUB_CONSOLE_FOLDERS,    /* per-console folder list subtitle */
     S_OPEN,                   /* right-cell value: actionable */
     S_LOCKED,                 /* right-cell value: disabled until unlocked */
+    /* ---- ROM-folder dialog on the Installed tab (Y on a console) ---- */
+    S_ROM_FOLDER_INSTALLS_TO, /* dialog body: "Installs to:\n%s" */
+    S_ROM_FOLDER_DEFAULT_TAG, /* body line when using the default location */
+    S_ROM_FOLDER_CUSTOM_TAG,  /* body line when a custom folder is set */
+    S_ROM_FOLDER_LOCKED_NOTE, /* body note when per-console folders are off */
+    S_SET_FOLDER,             /* button: choose a custom folder */
+    S_CHANGE_FOLDER,          /* button: choose a different custom folder */
+    S_RESET_DEFAULT,          /* button: clear the custom folder */
+    S_RECEIVE_FROM_PC,        /* button: open the LAN receiver for this console */
+    S_PIN,                    /* menu entry: pin this console to the top */
+    S_UNPIN,                  /* menu entry: unpin this console */
+    S_SORT_MENU,              /* menu entry: open the sort picker */
+    S_ROM_RECV_TITLE,         /* receive-screen title, e.g. "Receive game" */
+    S_ROM_RECV_STEPS,         /* on-screen steps for the ROM receiver (%s = console) */
+    S_ROM_RECV_INTO,          /* live line: which folder files land in (%s = path) */
+    S_ROM_RECV_CONFIRM,       /* overwrite confirm body (%s = filename) */
+    S_ROM_RECV_DONE,          /* toast after a game is saved (%s = filename) */
+    S_ROM_RECV_FAIL,          /* toast when the received file couldn't be saved */
 
     /* ---- downloads folder ---- */
     S_TITLE_DOWNLOADS,
@@ -444,6 +462,7 @@ enum {
     S_SEC_SOURCES,
     S_SEC_STORAGE,
     S_SEC_TRANSFERS,
+    S_SEC_INSTALL_PC,
     S_SEC_ACCOUNT,
     S_SEC_UPDATES,
     S_SEC_LOGS,
@@ -456,6 +475,7 @@ enum {
     S_TITLE_SOURCES,      S_SUB_SOURCES,
     S_TITLE_STORAGE,      S_SUB_STORAGE,
     S_TITLE_TRANSFERS,    S_SUB_TRANSFERS,
+    S_TITLE_RECV_CONSOLE, S_SUB_RECV_CONSOLE,
     S_TITLE_ACCOUNT,      S_SUB_ACCOUNT,
     S_TITLE_UPDATES,      S_SUB_UPDATES,
     S_TITLE_DIAGNOSTICS,  S_SUB_DIAGNOSTICS,

@@ -227,10 +227,22 @@ static void MD5_Final(unsigned char *result, MD5_CTX *ctx) {
     memset(ctx, 0, sizeof(*ctx));
 }
 
-bool md5_file(const char *path, char out_hex[33], volatile bool *cancel) {
+bool md5_file(const char *path, char out_hex[33], volatile bool *cancel,
+              md5_progress_cb progress, void *ud) {
     FILE *f = fopen(path, "rb");
     if (!f) {
         return false;
+    }
+    /* File size up front so the callback can report a percentage. A seekable
+     * regular file on the SD card always answers; if it doesn't, fall back to
+     * total=0 (the UI just shows an indeterminate/no bar) rather than failing. */
+    uint64_t total = 0;
+    if (fseeko(f, 0, SEEK_END) == 0) {
+        off_t sz = ftello(f);
+        if (sz > 0) {
+            total = (uint64_t)sz;
+        }
+        rewind(f);
     }
     /* 512KB reads: fewer SD round-trips than 64KB during verification, so the
      * verify phase finishes faster and holds the (shared) SD bus for less total
@@ -247,8 +259,13 @@ bool md5_file(const char *path, char out_hex[33], volatile bool *cancel) {
 
     size_t r;
     bool aborted = false;
+    uint64_t done = 0;
     while ((r = fread(buf, 1, MD5_BUF, f)) > 0) {
         MD5_Update(&ctx, buf, (unsigned long)r);
+        done += r;
+        if (progress) {
+            progress(ud, done, total);
+        }
         if (cancel && *cancel) {
             aborted = true;
             break;

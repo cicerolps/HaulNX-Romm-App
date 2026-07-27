@@ -3,6 +3,7 @@
 #include "config.h" /* SOURCES_PATH: the file this page uploads and exports */
 
 #include <arpa/inet.h>
+#include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <netinet/in.h>
@@ -16,6 +17,17 @@
 #include <unistd.h>
 
 #define HDR_MAX 8192 /* a request head larger than this is not ours */
+/* Scratch size for streaming a ROM upload to disk: recv this much, write it,
+ * repeat. Bounds the per-frame disk work so a big transfer doesn't stall the
+ * render loop, and keeps memory flat regardless of the file's size. */
+#define STREAM_BUF (64 * 1024)
+/* Cap on bytes drained to disk in a single poll. The LAN outruns the SD card,
+ * so without a ceiling one poll would keep recv+writing for the whole transfer
+ * — the socket buffer refills as fast as it drains — and freeze the render
+ * thread until it finished (or the stalled connection died). Draining a bounded
+ * slice and returning keeps the UI at frame rate, advances the progress bar, and
+ * feeds the idle watchdog; the next poll resumes where this one left off. */
+#define STREAM_PER_POLL (512 * 1024)
 
 /* Requests are read incrementally, a slice per poll, so the UI thread keeps
  * rendering during a large upload and can show its progress. Responses are
@@ -172,6 +184,69 @@ static const char PAGE_NRO[] =
     "<button id=go disabled>Send to Switch</button>"
     "</form>" UPLOAD_SCRIPT "</div>";
 
+/* The ROM upload page, shown while a per-console "Receive from PC" screen is
+ * open. Unlike the collection/nro pages it posts the file as a raw body (not a
+ * multipart form) so the console can stream it straight to the card — a game
+ * can be gigabytes, far too large to buffer. The filename rides in X-Filename,
+ * percent-encoded; the upload is driven by XHR so it can show a progress bar
+ * and, because the response is a plain 200 rather than a redirect, stay on this
+ * page afterwards. The console decides which folder it lands in (the screen was
+ * opened for one console), so there is nothing to choose here but the file. */
+#define ROM_SCRIPT                                                             \
+    "<script>"                                                                 \
+    "var d=document.getElementById('drop'),i=d.querySelector('input'),"        \
+    "b=document.getElementById('go'),n=d.querySelector('b'),"                   \
+    "st=document.getElementById('st'),bar=document.getElementById('bar'),f=0;" \
+    "function s(){if(i.files.length){f=i.files[0];n.textContent=f.name;"        \
+    "b.disabled=false;}}"                                                       \
+    "i.addEventListener('change',s);"                                          \
+    "['dragenter','dragover'].forEach(function(e){d.addEventListener(e,"        \
+    "function(v){v.preventDefault();d.classList.add('over');});});"            \
+    "['dragleave','drop'].forEach(function(e){d.addEventListener(e,"           \
+    "function(v){v.preventDefault();d.classList.remove('over');});});"         \
+    "d.addEventListener('drop',function(v){i.files=v.dataTransfer.files;s();});"\
+    "b.addEventListener('click',function(){if(!f)return;b.disabled=true;"       \
+    "i.disabled=true;var x=new XMLHttpRequest();"                              \
+    "x.open('POST',location.pathname.replace(/\\/+$/,''));"                    \
+    "x.setRequestHeader('X-Filename',encodeURIComponent(f.name));"             \
+    "x.upload.onprogress=function(e){if(e.lengthComputable){var p="            \
+    "Math.round(e.loaded*100/e.total);bar.style.width=p+'%';"                  \
+    "st.textContent='Sending '+p+'%';}};"                                      \
+    "x.onload=function(){if(x.status>=200&&x.status<300){bar.style.width="     \
+    "'100%';st.textContent='Sent. Confirm on your Switch.';}else{"             \
+    "st.textContent='Refused (HTTP '+x.status+'). Re-open the receive screen "  \
+    "and use the address it shows.';b.disabled=false;i.disabled=false;}};"     \
+    "x.onerror=function(){st.textContent='Network error \\u2014 is the "        \
+    "receive screen still open?';b.disabled=false;i.disabled=false;};"         \
+    "x.send(f);});"                                                            \
+    "</script>"
+
+static const char PAGE_ROM[] =
+    "<!doctype html><meta charset=utf-8>"
+    "<meta name=viewport content=\"width=device-width,initial-scale=1\">"
+    "<title>HaulNX - Send a game</title>" PAGE_CSS UPLOAD_CSS
+    "<style>#st{margin-top:1rem;color:var(--dim);font-size:.9rem;"
+    "min-height:1.2em;text-align:center}"
+    ".pbar{margin-top:.75rem;height:.4rem;background:var(--line);"
+    "border-radius:.3rem;overflow:hidden}"
+    "#bar{height:100%;width:0;background:var(--accent);transition:width .15s}"
+    "</style>"
+    "<div class=card>"
+    "<header><img src=\"/logo.png\" alt=\"\">"
+    "<div><h1>Haul<span>NX</span></h1><p>Send a game</p></div></header>"
+    "<ol>"
+    "<li>Drop the game file below, or click to browse for it.</li>"
+    "<li>Send it &mdash; it copies into the folder for the console you opened "
+    "this screen from.</li>"
+    "<li>Confirm on your Switch if it would replace a file already there.</li>"
+    "</ol>"
+    "<label id=drop><b>Drop a game file here</b>or click to choose a file"
+    "<input type=file name=f required>"
+    "</label>"
+    "<button id=go disabled>Send to Switch</button>"
+    "<div class=pbar><div id=bar></div></div>"
+    "<div id=st></div>" ROM_SCRIPT "</div>";
+
 /* Served at /sent, which a successful upload is redirected to. Reaching this
  * by GET is the point: it leaves the browser on a page it can safely reload,
  * instead of on a POST result that a reload would silently re-submit. */
@@ -281,6 +356,66 @@ static void send_redirect(int fd, const char *loc) {
         return;
     }
     send_all(fd, head, (size_t)n);
+}
+
+/* Answer a CORS preflight. The collection/nro pushes are CORS-simple and never
+ * preflight, but the ROM push sets X-Filename, which does — and it comes from
+ * the app utility opened off disk (a "null" origin). Allowing any header keeps
+ * that request unblocked; the one-time code in the path is still what gates it,
+ * not the origin. */
+static void send_preflight(int fd) {
+    static const char resp[] =
+        "HTTP/1.1 204 No Content\r\n"
+        "Access-Control-Allow-Origin: *\r\n"
+        "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
+        "Access-Control-Allow-Headers: *\r\n"
+        "Access-Control-Max-Age: 600\r\n"
+        "Content-Length: 0\r\n"
+        "Connection: close\r\n\r\n";
+    send_all(fd, resp, sizeof(resp) - 1);
+}
+
+/* Turn a client-supplied name into a safe basename inside dest_dir. It arrives
+ * percent-encoded in X-Filename (so spaces and unicode survive a header field),
+ * so decode first, then drop any directory part and neutralise the characters a
+ * path walk or FAT would choke on. False if nothing usable is left. */
+static bool sanitize_filename(const char *in, char *out, size_t out_sz) {
+    char dec[512];
+    size_t o = 0;
+    for (const char *p = in; *p && p[0] != '\r' && p[0] != '\n' &&
+                             o + 1 < sizeof(dec);
+         p++) {
+        if (p[0] == '%' && isxdigit((unsigned char)p[1]) &&
+            isxdigit((unsigned char)p[2])) {
+            char h[3] = {p[1], p[2], '\0'};
+            dec[o++] = (char)strtol(h, NULL, 16);
+            p += 2;
+        } else {
+            dec[o++] = p[0];
+        }
+    }
+    dec[o] = '\0';
+    /* basename: everything after the last slash of either kind */
+    const char *base = dec;
+    for (const char *q = dec; *q; q++) {
+        if (*q == '/' || *q == '\\') {
+            base = q + 1;
+        }
+    }
+    if (base[0] == '\0' || strcmp(base, ".") == 0 || strcmp(base, "..") == 0) {
+        return false;
+    }
+    size_t j = 0;
+    for (const char *q = base; *q && j + 1 < out_sz; q++) {
+        unsigned char c = (unsigned char)*q;
+        if (c == '/' || c == '\\' || c == ':' || c == '*' || c == '?' ||
+            c == '"' || c == '<' || c == '>' || c == '|' || c < 0x20) {
+            c = '_';
+        }
+        out[j++] = (char)c;
+    }
+    out[j] = '\0';
+    return j > 0;
 }
 
 /* Send a file from romfs/SD as a complete response. With `dl_name` set the
@@ -423,6 +558,17 @@ static void client_reset(HttpSrv *s) {
         close(s->client_fd);
         s->client_fd = -1;
     }
+    /* A still-open sink means a ROM stream was interrupted (peer dropped, or the
+     * user backed out of the receive screen). Close and delete the partial file
+     * so an aborted transfer never leaves a truncated ".part" behind. A completed
+     * transfer has already nulled sink and kept its file for the caller to move. */
+    if (s->sink) {
+        fclose(s->sink);
+        s->sink = NULL;
+        if (s->part_path[0]) {
+            remove(s->part_path);
+        }
+    }
     free(s->head);
     s->head = NULL;
     s->head_len = 0;
@@ -512,7 +658,15 @@ static int client_idle(HttpSrv *s, bool got_data) {
     if (got_data || s->last_data_ns == 0) {
         s->last_data_ns = now;
     } else if (now - s->last_data_ns > CLIENT_IDLE_NS) {
+        /* A ROM stream that goes quiet mid-transfer is a failure the caller
+         * should report, not a silent drop like an abandoned GET. */
+        bool rom = s->sink != NULL;
+        if (rom) {
+            snprintf(s->last_err, sizeof(s->last_err), "no data for %llus",
+                     CLIENT_IDLE_NS / 1000000000ULL);
+        }
         client_reset(s);
+        return rom ? 4 : 0;
     }
     return 0;
 }
@@ -525,7 +679,7 @@ static int respond_simple(HttpSrv *s, int fd, const char *head) {
     size_t pl = req_path(head, &p);
     size_t tl = strlen(s->token) + 1; /* "/<token>" */
     if (strncmp(head, "OPTIONS ", 8) == 0) {
-        send_resp(fd, "204 No Content", "text/plain", NULL);
+        send_preflight(fd);
     } else if (!host_ok(s, head)) {
         send_resp(fd, "403 Forbidden", "text/plain", "wrong host");
     } else if (pl == 9 && strncmp(p, "/logo.png", 9) == 0) {
@@ -545,6 +699,8 @@ static int respond_simple(HttpSrv *s, int fd, const char *head) {
             page = PAGE_NRO;
         } else if (s->mode == HTTPSRV_MODE_EXPORT) {
             page = PAGE_EXPORT;
+        } else if (s->mode == HTTPSRV_MODE_ROM) {
+            page = PAGE_ROM;
         }
         send_resp(fd, "200 OK", "text/html; charset=utf-8", page);
     } else if (s->mode == HTTPSRV_MODE_EXPORT && pl == tl + 16 && p[0] == '/' &&
@@ -650,7 +806,10 @@ static int client_step(HttpSrv *s) {
             client_reset(s);
             return 0;
         }
-        if (clen > HTTPSRV_MAX_BODY) {
+        long long maxb = (s->mode == HTTPSRV_MODE_ROM)
+                             ? (long long)HTTPSRV_MAX_ROM
+                             : (long long)HTTPSRV_MAX_BODY;
+        if ((long long)clen > maxb) {
             make_blocking(fd);
             send_resp(fd, "413 Payload Too Large", "text/plain", "too big");
             client_reset(s);
@@ -669,44 +828,186 @@ static int client_step(HttpSrv *s) {
         }
         s->ctype[ci] = '\0';
 
-        char *body = malloc((size_t)clen + 1);
-        if (!body) {
-            client_reset(s);
-            return 0;
-        }
+        /* Bytes of the body that already rode in with the head's last recv. */
         size_t have = s->head_len - (size_t)(body_start - s->head);
         if (have > (size_t)clen) {
             have = (size_t)clen;
         }
-        memcpy(body, body_start, have);
-        s->cbody = body;
-        s->cbody_len = have;
-        s->cbody_total = (size_t)clen;
+
+        if (s->mode == HTTPSRV_MODE_ROM) {
+            /* ROM upload: stream the raw body straight to <dest_dir>/<name>.part
+             * so a multi-GB game never has to fit in RAM. The ROM page posts the
+             * file as the whole body (no multipart) precisely for this; reject a
+             * form so the envelope never lands in the file. */
+            if (strncasecmp(s->ctype, "multipart/form-data", 19) == 0) {
+                make_blocking(fd);
+                send_resp(fd, "400 Bad Request", "text/plain",
+                          "raw body expected");
+                client_reset(s);
+                return 0;
+            }
+            const char *fn = hdr_val(s->head, "x-filename:");
+            char name[256];
+            if (!s->dest_dir[0] || !fn ||
+                !sanitize_filename(fn, name, sizeof(name))) {
+                make_blocking(fd);
+                send_resp(fd, "400 Bad Request", "text/plain", "no filename");
+                client_reset(s);
+                return 0;
+            }
+            snprintf(s->recv_name, sizeof(s->recv_name), "%s", name);
+            int pn = snprintf(s->part_path, sizeof(s->part_path), "%s/%s.part",
+                              s->dest_dir, name);
+            if (pn <= 0 || (size_t)pn >= sizeof(s->part_path)) {
+                make_blocking(fd);
+                send_resp(fd, "400 Bad Request", "text/plain", "name too long");
+                client_reset(s);
+                return 0;
+            }
+            s->sink = fopen(s->part_path, "wb");
+            char *scratch = s->sink ? malloc(STREAM_BUF) : NULL;
+            if (!s->sink || !scratch) {
+                if (s->sink) {
+                    fclose(s->sink);
+                    s->sink = NULL;
+                    remove(s->part_path);
+                }
+                make_blocking(fd);
+                send_resp(fd, "500 Internal Server Error", "text/plain",
+                          "cannot write");
+                client_reset(s);
+                return 0;
+            }
+            /* Write the over-read bytes before freeing the head they point into. */
+            if (have > 0 && fwrite(body_start, 1, have, s->sink) != have) {
+                free(scratch);
+                fclose(s->sink);
+                s->sink = NULL;
+                remove(s->part_path);
+                make_blocking(fd);
+                send_resp(fd, "507 Insufficient Storage", "text/plain",
+                          "write failed");
+                snprintf(s->last_err, sizeof(s->last_err),
+                         "write failed (card full?)");
+                client_reset(s);
+                return 4;
+            }
+            s->cbody = scratch;         /* scratch recv buffer, not accumulation */
+            s->cbody_len = have;        /* bytes written to disk so far */
+            s->cbody_total = (size_t)clen;
+        } else {
+            char *body = malloc((size_t)clen + 1);
+            if (!body) {
+                client_reset(s);
+                return 0;
+            }
+            memcpy(body, body_start, have);
+            s->cbody = body;
+            s->cbody_len = have;
+            s->cbody_total = (size_t)clen;
+        }
         free(s->head);
         s->head = NULL;
         s->head_len = 0;
     }
 
     /* Phase 2: the body, as much as has arrived. */
-    while (s->cbody_len < s->cbody_total) {
-        ssize_t r = recv(fd, s->cbody + s->cbody_len,
-                         s->cbody_total - s->cbody_len, 0);
-        if (r > 0) {
-            s->cbody_len += (size_t)r;
-            got_data = true;
-            continue;
+    if (s->sink) {
+        /* Streaming to disk: recv into the scratch buffer and write it out a
+         * slice per frame. cbody_len is the running count of bytes written, so
+         * httpsrv_receiving still reports progress. Bounded to STREAM_PER_POLL a
+         * poll so a fast sender can't monopolise the render thread — the outer
+         * "not done yet" path below resumes it next frame. */
+        size_t drained = 0;
+        while (s->cbody_len < s->cbody_total && drained < STREAM_PER_POLL) {
+            size_t want = s->cbody_total - s->cbody_len;
+            if (want > STREAM_BUF) {
+                want = STREAM_BUF;
+            }
+            ssize_t r = recv(fd, s->cbody, want, 0);
+            if (r > 0) {
+                if (fwrite(s->cbody, 1, (size_t)r, s->sink) != (size_t)r) {
+                    /* Card full or write error: give up. client_reset closes the
+                     * sink and deletes the partial file. */
+                    make_blocking(fd);
+                    send_resp(fd, "507 Insufficient Storage", "text/plain",
+                              "write failed");
+                    snprintf(s->last_err, sizeof(s->last_err),
+                             "write failed (card full?)");
+                    client_reset(s);
+                    return 4;
+                }
+                s->cbody_len += (size_t)r;
+                drained += (size_t)r;
+                got_data = true;
+                continue;
+            }
+            if (r == 0) {
+                snprintf(s->last_err, sizeof(s->last_err),
+                         "peer closed at %zu/%zu", s->cbody_len,
+                         s->cbody_total);
+                client_reset(s); /* peer hung up before the whole body arrived */
+                return 4;
+            }
+            if (r < 0 && errno == EINTR) {
+                continue;
+            }
+            if (r < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                break;
+            }
+            snprintf(s->last_err, sizeof(s->last_err), "recv errno %d", errno);
+            client_reset(s); /* errored mid-body */
+            return 4;
         }
-        if (r < 0 && errno == EINTR) {
-            continue;
+    } else {
+        while (s->cbody_len < s->cbody_total) {
+            ssize_t r = recv(fd, s->cbody + s->cbody_len,
+                             s->cbody_total - s->cbody_len, 0);
+            if (r > 0) {
+                s->cbody_len += (size_t)r;
+                got_data = true;
+                continue;
+            }
+            if (r < 0 && errno == EINTR) {
+                continue;
+            }
+            if (r < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                break;
+            }
+            client_reset(s); /* peer closed or errored mid-body */
+            return 0;
         }
-        if (r < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-            break;
-        }
-        client_reset(s); /* peer closed or errored mid-body */
-        return 0;
     }
     if (s->cbody_len < s->cbody_total) {
         return client_idle(s, got_data);
+    }
+
+    if (s->sink) {
+        /* Streamed ROM complete: flush and close. A close error means buffered
+         * writes never reached the card, so treat it as a failed transfer. On
+         * success the finished ".part" is left for the caller to confirm and
+         * move into place (see httpsrv.h); recv_name/part_path already hold it. */
+        int cerr = fclose(s->sink);
+        s->sink = NULL; /* so client_reset keeps the finished file */
+        free(s->cbody);
+        s->cbody = NULL;
+        s->cbody_len = 0;
+        s->cbody_total = 0;
+        make_blocking(fd);
+        if (cerr != 0) {
+            remove(s->part_path);
+            send_resp(fd, "507 Insufficient Storage", "text/plain",
+                      "write failed");
+            snprintf(s->last_err, sizeof(s->last_err),
+                     "flush failed (card full?)");
+            client_reset(s);
+            return 4;
+        }
+        send_resp(fd, "200 OK", "text/plain", "received");
+        s->body = NULL; /* streamed straight to disk; nothing in RAM */
+        s->body_len = 0;
+        client_reset(s);
+        return 1;
     }
 
     /* Complete. The page posts a form; a direct POST sends the file as the
@@ -815,6 +1116,7 @@ int httpsrv_poll(HttpSrv *s) {
         }
         s->head_len = 0;
         s->head[0] = '\0';
+        s->last_err[0] = '\0';
         s->last_data_ns = armTicksToNs(armGetSystemTick());
         s->conn_start_ns = s->last_data_ns;
     }
