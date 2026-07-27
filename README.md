@@ -52,7 +52,7 @@ everything you download from then on just appears.
   selection — a single deliberate **A** on one file is never filtered
 
 **Download queue**
-- Holds **256 items** and runs **5 at once** by default; change the limit and it
+- Holds **256 items** and runs up to **10 at once** by default; change the limit and it
   applies immediately — lowering it pauses the excess, which resume where they
   stopped as slots free up
 - Resumable, and **persists across app restarts** — interrupted downloads pick up
