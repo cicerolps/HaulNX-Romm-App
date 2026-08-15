@@ -73,6 +73,58 @@ static int int_field(const char *js, jsmntok_t *tok, int obj, const char *key) {
     return (int)json_u64(js, tok, json_obj_get(js, tok, obj, key));
 }
 
+/* Base64-encode src (RFC 4648, standard alphabet, '=' padded) into out
+ * (NUL-terminated). out_sz must be at least 4*ceil(len/3) + 1; a too-small
+ * buffer truncates rather than overflowing. */
+static void base64_encode(const unsigned char *src, size_t len, char *out,
+                          size_t out_sz) {
+    static const char tbl[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    size_t o = 0, i = 0;
+    for (; i + 3 <= len && o + 4 < out_sz; i += 3) {
+        uint32_t n = ((uint32_t)src[i] << 16) | ((uint32_t)src[i + 1] << 8) |
+                    src[i + 2];
+        out[o++] = tbl[(n >> 18) & 0x3F];
+        out[o++] = tbl[(n >> 12) & 0x3F];
+        out[o++] = tbl[(n >> 6) & 0x3F];
+        out[o++] = tbl[n & 0x3F];
+    }
+    size_t rem = len - i;
+    if (rem == 1 && o + 4 < out_sz) {
+        uint32_t n = (uint32_t)src[i] << 16;
+        out[o++] = tbl[(n >> 18) & 0x3F];
+        out[o++] = tbl[(n >> 12) & 0x3F];
+        out[o++] = '=';
+        out[o++] = '=';
+    } else if (rem == 2 && o + 4 < out_sz) {
+        uint32_t n = ((uint32_t)src[i] << 16) | ((uint32_t)src[i + 1] << 8);
+        out[o++] = tbl[(n >> 18) & 0x3F];
+        out[o++] = tbl[(n >> 12) & 0x3F];
+        out[o++] = tbl[(n >> 6) & 0x3F];
+        out[o++] = '=';
+    }
+    out[o] = '\0';
+}
+
+void romm_creds_queue_auth_header(const RommCredentials *c, char *out,
+                                  size_t out_sz) {
+    if (c->api_token[0]) {
+        snprintf(out, out_sz, "authorization: Bearer %s", c->api_token);
+        return;
+    }
+    if (c->username[0] && c->password[0]) {
+        char userpass[300];
+        snprintf(userpass, sizeof(userpass), "%s:%s", c->username,
+                c->password);
+        char b64[420];
+        base64_encode((const unsigned char *)userpass, strlen(userpass), b64,
+                      sizeof(b64));
+        snprintf(out, out_sz, "authorization: Basic %s", b64);
+        return;
+    }
+    out[0] = '\0';
+}
+
 /* ---- transport ------------------------------------------------------- */
 
 /* One GET against the RomM API: builds the URL (server_url + path), attaches

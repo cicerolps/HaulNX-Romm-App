@@ -78,6 +78,16 @@ bool romm_test_connection(const RommCredentials *c, long *http_code, char *err,
 void romm_content_url(const RommCredentials *c, const RommRom *rom, char *out,
                       size_t out_sz);
 
+/* Build a raw "authorization: ..." header line for the download queue
+ * (queue_add_ex's auth param): "Bearer <token>" when an API token is set
+ * (priority, matching romm_creds_configured), else HTTP Basic
+ * ("Basic <base64 of user:pass>") -- queue.c/net.c only know how to send a
+ * literal header, unlike http_get_authed's CURLOPT_USERPWD, so Basic is
+ * built by hand here. Empty string if neither credential is set. Recommend
+ * out_sz >= 400 (worst case: two 128-byte fields, base64'd). */
+void romm_creds_queue_auth_header(const RommCredentials *c, char *out,
+                                  size_t out_sz);
+
 /*
  * Map a RomM platform to a HaulNX console (target) — one of the strings
  * romfs:/dl_sources.json ships in its "consoles" list, e.g. "snes", "n64",

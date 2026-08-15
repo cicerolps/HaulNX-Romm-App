@@ -98,6 +98,25 @@ bool http_download(const char *url, const char *dest_path,
                    uint64_t resume_from,
                    long *http_code);
 
+/*
+ * Like http_download, but for a provider with its own credentials scoped to
+ * a single configured host (e.g. a self-hosted RomM instance) rather than
+ * archive.org's. extra_header is sent only when url's host exactly matches
+ * auth_host (net_url_host_eq) -- over http or https alike, since a
+ * self-hosted instance may have no TLS at all. Redirects are never followed:
+ * a file-content endpoint has no legitimate reason to redirect, and not
+ * following one closes off any question of where the header could end up.
+ * verify_tls=false skips TLS certificate verification (a self-signed/LAN
+ * certificate). Other params behave exactly as http_download's.
+ */
+bool http_download_authed(const char *url, const char *dest_path,
+                          const char *auth_host, const char *extra_header,
+                          bool verify_tls,
+                          net_progress_cb cb, void *userdata,
+                          net_rate_cb rate_cb, void *rate_ud,
+                          uint64_t resume_from,
+                          long *http_code);
+
 /* Which half of the speed test is running (see SpeedProg). */
 typedef enum {
     SP_IDLE = 0,

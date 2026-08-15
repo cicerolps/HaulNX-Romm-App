@@ -17,6 +17,13 @@ typedef struct {
     char format[128]; /* archive.org "format" field, e.g. "ZIP" */
     uint64_t size;    /* bytes, 0 if unknown */
     char md5[33];     /* expected MD5 hex from metadata, "" if unknown */
+    /* Full download URL, bypassing ia_file_url's base+name construction.
+     * Empty for every archive.org file (ia_fetch never sets this) -- exists
+     * so a non-archive.org provider whose files don't share one item-level
+     * base (e.g. RomM, where each rom's URL carries its own numeric id) can
+     * still populate an ArchiveItem/ArchiveFile list and reuse the Files
+     * screen built around them. */
+    char url_override[768];
 } ArchiveFile;
 
 typedef struct {
@@ -50,7 +57,9 @@ bool ia_fetch(const char *identifier, ArchiveItem *item, bool use_cache,
 bool ia_fetch_on(void *conn, const char *identifier, ArchiveItem *item,
                  bool use_cache, const char *cache_dir);
 
-/* Build the canonical download URL for a file in the item. */
+/* Build the canonical download URL for a file in the item. If
+ * file->url_override is set, it is copied out as-is and item is ignored --
+ * see ArchiveFile.url_override. */
 void ia_file_url(const ArchiveItem *item, const ArchiveFile *file,
                  char *out, size_t out_sz);
 
