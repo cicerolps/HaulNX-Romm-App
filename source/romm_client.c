@@ -384,10 +384,26 @@ void romm_cover_url(const RommCredentials *c, const RommRom *rom, char *out,
         out[0] = '\0';
         return;
     }
+    /* path_cover_small carries a "?ts=<updated_at>" cache-busting suffix
+     * whose value is RomM's server building it from Python's raw
+     * str(datetime) rather than isoformat() -- e.g. "2026-01-01
+     * 00:54:22.107990+00:00", with an unencoded space before the time. Handed
+     * to curl as-is, that space silently breaks the request (no cover ever
+     * loads, nothing else visibly wrong -- see the grid's fallback-icon
+     * behavior). Drop the query entirely: harmless, since this client caches
+     * every cover to disk forever once fetched (RommCoversStart never
+     * re-fetches a path that already exists), so cache-busting serves no
+     * purpose here anyway. */
+    char path[600];
+    snprintf(path, sizeof(path), "%s", rom->path_cover_small);
+    char *q = strchr(path, '?');
+    if (q) {
+        *q = '\0';
+    }
     /* path_cover_small already starts with '/' and is itself a static-asset
-     * path (not under /api) -- server_url + path_cover_small is the whole
-     * URL, same concatenation romm_content_url does for /api paths. */
-    snprintf(out, out_sz, "%s%s", c->server_url, rom->path_cover_small);
+     * path (not under /api) -- server_url + path is the whole URL, same
+     * concatenation romm_content_url does for /api paths. */
+    snprintf(out, out_sz, "%s%s", c->server_url, path);
 }
 
 /* ---- platform -> HaulNX console mapping --------------------------------- */
