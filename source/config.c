@@ -763,6 +763,78 @@ bool creds_save(const Credentials *c) {
     return commit_staged(f, CREDS_TMP_PATH, CREDS_PATH);
 }
 
+/* ---- RomM credentials --------------------------------------------------- */
+
+void romm_creds_load(RommCredentials *c) {
+    memset(c, 0, sizeof(*c));
+    size_t len = 0;
+    char *js = json_read_file(ROMM_CREDS_PATH, &len);
+    if (!js) {
+        return;
+    }
+    int ntok = 0;
+    jsmntok_t *tok = json_parse_alloc(js, len, &ntok);
+    if (tok && tok[0].type == JSMN_OBJECT) {
+        json_copy(js, tok, json_obj_get(js, tok, 0, "serverUrl"), c->server_url,
+                  sizeof(c->server_url));
+        json_copy(js, tok, json_obj_get(js, tok, 0, "username"), c->username,
+                  sizeof(c->username));
+        json_copy(js, tok, json_obj_get(js, tok, 0, "password"), c->password,
+                  sizeof(c->password));
+        json_copy(js, tok, json_obj_get(js, tok, 0, "apiToken"), c->api_token,
+                  sizeof(c->api_token));
+        c->ignore_cert_verify = json_bool(
+            js, tok, json_obj_get(js, tok, 0, "ignoreCertVerify"));
+        /* Trim a trailing slash the user may have typed, so URL-building code
+         * (romm_client.c) can always append "/api/..." directly. */
+        size_t n = strlen(c->server_url);
+        while (n > 0 && c->server_url[n - 1] == '/') {
+            c->server_url[--n] = '\0';
+        }
+    }
+    free(tok);
+    free(js);
+}
+
+bool romm_creds_save(const RommCredentials *c) {
+    fs_mkdir_p(DATA_DIR);
+    FILE *f = fopen(ROMM_CREDS_TMP_PATH, "wb");
+    if (!f) {
+        return false;
+    }
+    char url[256];
+    sset(url, sizeof(url), c->server_url);
+    size_t n = strlen(url);
+    while (n > 0 && url[n - 1] == '/') {
+        url[--n] = '\0';
+    }
+    fputs("{\n  \"serverUrl\": ", f);
+    json_write_escaped(f, url);
+    fputs(",\n  \"username\": ", f);
+    json_write_escaped(f, c->username);
+    fputs(",\n  \"password\": ", f);
+    json_write_escaped(f, c->password);
+    fputs(",\n  \"apiToken\": ", f);
+    json_write_escaped(f, c->api_token);
+    fprintf(f, ",\n  \"ignoreCertVerify\": %s\n}\n",
+            c->ignore_cert_verify ? "true" : "false");
+    return commit_staged(f, ROMM_CREDS_TMP_PATH, ROMM_CREDS_PATH);
+}
+
+bool romm_creds_remove(void) {
+    if (!fs_exists(ROMM_CREDS_PATH)) {
+        return true;
+    }
+    return fs_rm_rf(ROMM_CREDS_PATH);
+}
+
+bool romm_creds_configured(const RommCredentials *c) {
+    if (!c->server_url[0]) {
+        return false;
+    }
+    return c->api_token[0] || (c->username[0] && c->password[0]);
+}
+
 /* ---- preferences ------------------------------------------------------ */
 
 static void prefs_ext_seed_defaults(Prefs *p); /* defined below */

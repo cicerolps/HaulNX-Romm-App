@@ -40,6 +40,11 @@ extern "C" {
 /* Staging files, same reasoning as SOURCES_TMP_PATH; never read back. */
 #define CREDS_TMP_PATH DATA_DIR "/credentials.tmp.json"
 #define PREFS_TMP_PATH DATA_DIR "/prefs.tmp.json"
+/* RomM instance credentials: a second, independent source alongside
+ * archive.org. Kept in its own file (not merged into credentials.json) so the
+ * two sources can be configured, tested and removed independently. */
+#define ROMM_CREDS_PATH     DATA_DIR "/romm_credentials.json"
+#define ROMM_CREDS_TMP_PATH DATA_DIR "/romm_credentials.tmp.json"
 /* Download queue state and the Installed-tab folder-size cache: derived data,
  * so they live with the other state in config/, not with the logs. */
 #define QUEUE_STATE_PATH DATA_DIR "/queue.json"
@@ -111,6 +116,21 @@ typedef struct {
     char access_key[128];
     char secret[128];
 } Credentials;
+
+/* RomM instance credentials (a self-hosted RomM server, independent of
+ * archive.org). server_url has no trailing slash, e.g.
+ * "https://romm.example.com" or "http://192.168.1.10:8080". Either
+ * username+password (HTTP Basic) or api_token (Bearer, "rmm_...") authenticate
+ * requests; if both are set, api_token takes priority (see
+ * romm_creds_auth_header). ignore_cert_verify skips TLS certificate
+ * verification, for instances with a self-signed/LAN certificate. */
+typedef struct {
+    char server_url[256];
+    char username[128];
+    char password[128];
+    char api_token[128];
+    bool ignore_cert_verify;
+} RommCredentials;
 
 #define MAX_PINNED_DIRS 32
 #define MAX_FILTER_EXTS 40
@@ -239,6 +259,18 @@ void repo_set_url_default(Repo *r);
 /* Credentials (archive.org S3 access/secret). */
 void creds_load(Credentials *c);
 bool creds_save(const Credentials *c);
+
+/* RomM instance credentials. romm_creds_load always fills *c (zeroed if no
+ * file exists yet). romm_creds_remove deletes the file, leaving RomM
+ * unconfigured; true if removed or already absent. */
+void romm_creds_load(RommCredentials *c);
+bool romm_creds_save(const RommCredentials *c);
+bool romm_creds_remove(void);
+
+/* True if enough is set to attempt a connection (server_url plus either
+ * api_token or username+password). Does not mean the credentials are valid —
+ * only that romm_client_test_connection() is worth calling. */
+bool romm_creds_configured(const RommCredentials *c);
 
 /* Preferences. Defaults to use_cache=true if no prefs file exists. */
 void prefs_load(Prefs *p);
