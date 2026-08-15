@@ -160,6 +160,52 @@ bool net_is_archive_org_url(const char *url) {
            strncasecmp(h + hl - dl, dom, dl) == 0;
 }
 
+bool net_url_host_eq(const char *url, const char *host) {
+    if (!url || !host || !host[0]) {
+        return false;
+    }
+    const char *p = strstr(url, "://");
+    if (!p) {
+        return false;
+    }
+    p += 3;
+    size_t alen = 0;
+    while (p[alen] && p[alen] != '/' && p[alen] != '\\' && p[alen] != '?' &&
+           p[alen] != '#') {
+        alen++;
+    }
+    size_t hs = 0;
+    for (size_t i = 0; i < alen; i++) {
+        if (p[i] == '@') {
+            hs = i + 1;
+        }
+    }
+    const char *h = p + hs;
+    size_t hl = alen - hs;
+    for (size_t i = 0; i < hl; i++) {
+        if (h[i] == ':') { /* drop the port */
+            hl = i;
+            break;
+        }
+    }
+    while (hl > 0 && h[hl - 1] == '.') {
+        hl--;
+    }
+
+    /* Same normalisation on the configured host (as typed into settings, e.g.
+     * "192.168.1.10:8080"): drop a port and a trailing dot, so the comparison
+     * only cares whether it is the same host. */
+    size_t hostlen = 0;
+    while (host[hostlen] && host[hostlen] != ':') {
+        hostlen++;
+    }
+    while (hostlen > 0 && host[hostlen - 1] == '.') {
+        hostlen--;
+    }
+
+    return hl > 0 && hl == hostlen && strncasecmp(h, host, hl) == 0;
+}
+
 /* Ceiling for an in-memory GET. The biggest legitimate response is an
  * archive.org /metadata/ listing for a huge item — single-digit MB. Anything
  * beyond this is a broken or hostile server, and letting it realloc without
@@ -446,6 +492,83 @@ char *http_get_on(void *conn, const char *url, long *http_code, size_t *out_len)
     }
     curl_easy_reset(c);
     return http_get_impl(c, url, http_code, out_len);
+}
+
+char *http_get_authed(const char *url, const char *auth_host,
+                      const char *user, const char *pass,
+                      const char *auth_header, bool verify_tls,
+                      long *http_code, size_t *out_len) {
+    CURL *c = curl_easy_init();
+    if (!c) {
+        return NULL;
+    }
+
+    struct mem_buf m;
+    m.data = (char *)malloc(1);
+    m.len = 0;
+    if (m.data) {
+        m.data[0] = '\0';
+    }
+
+    curl_easy_setopt(c, CURLOPT_URL, url);
+    /* No CURLOPT_FOLLOWLOCATION: a provider's JSON API has no legitimate
+     * reason to redirect, and not following one closes off any question of
+     * where the credential set below could end up. */
+    pin_protocols(c);
+    curl_easy_setopt(c, CURLOPT_USERAGENT, USER_AGENT);
+    curl_easy_setopt(c, CURLOPT_ACCEPT_ENCODING, "");
+    curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, mem_write);
+    curl_easy_setopt(c, CURLOPT_WRITEDATA, &m);
+    curl_easy_setopt(c, CURLOPT_TIMEOUT, 30L);
+    curl_easy_setopt(c, CURLOPT_CONNECTTIMEOUT, 20L);
+    apply_tls(c);
+
+    /* The credential is this provider's own (e.g. a RomM instance), never
+     * archive.org's or vice versa — re-checked here at the point of use,
+     * against the host the caller says it is meant for, exactly like the
+     * archive.org credential is re-checked in http_download. */
+    struct curl_slist *hdrs = NULL;
+    bool host_ok = net_url_host_eq(url, auth_host);
+    if (host_ok && user && user[0] && pass) {
+        char userpwd[300];
+        snprintf(userpwd, sizeof(userpwd), "%s:%s", user, pass);
+        curl_easy_setopt(c, CURLOPT_HTTPAUTH, CURLAUTH_BASIC);
+        curl_easy_setopt(c, CURLOPT_USERPWD, userpwd);
+    } else if (host_ok && auth_header && auth_header[0]) {
+        hdrs = curl_slist_append(hdrs, auth_header);
+        curl_easy_setopt(c, CURLOPT_HTTPHEADER, hdrs);
+    } else if (!host_ok && ((user && user[0]) || (auth_header && auth_header[0]))) {
+        net_log("SEC credential withheld, host mismatch: %s", url);
+    }
+
+    if (!verify_tls) {
+        curl_easy_setopt(c, CURLOPT_SSL_VERIFYPEER, 0L);
+        curl_easy_setopt(c, CURLOPT_SSL_VERIFYHOST, 0L);
+    }
+
+    CURLcode rc = curl_easy_perform(c);
+    long code = 0;
+    curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &code);
+    if (http_code) {
+        *http_code = code;
+    }
+
+    net_log("GET(authed) %s -> curl=%d(%s) http=%ld len=%lu", url, (int)rc,
+            curl_easy_strerror(rc), code, (unsigned long)m.len);
+
+    if (hdrs) {
+        curl_slist_free_all(hdrs);
+    }
+    curl_easy_cleanup(c);
+
+    if (rc != CURLE_OK) {
+        free(m.data);
+        return NULL;
+    }
+    if (out_len) {
+        *out_len = m.len;
+    }
+    return m.data;
 }
 
 struct dl_ctx {
