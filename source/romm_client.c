@@ -251,12 +251,23 @@ void romm_free_platforms(RommPlatformList *list) {
 static bool parse_roms(const char *body, size_t len, RommRomList *out) {
     int ntok = 0;
     jsmntok_t *tok = json_parse_alloc(body, len, &ntok);
-    if (!tok || tok[0].type != JSMN_ARRAY) {
+    if (!tok) {
+        return false;
+    }
+    /* GET /api/roms is paginated (fastapi-pagination's LimitOffsetPage): the
+     * top-level response is an object with an "items" array, unlike
+     * /api/platforms' bare array. A bare array is still accepted here too,
+     * in case some instance/version ever returns one directly. */
+    int items = 0;
+    if (tok[0].type == JSMN_OBJECT) {
+        items = json_obj_get(body, tok, 0, "items");
+    }
+    if (items < 0 || tok[items].type != JSMN_ARRAY) {
         free(tok);
         return false;
     }
 
-    int count = tok[0].size;
+    int count = tok[items].size;
     RommRom *arr =
         (RommRom *)calloc(count > 0 ? (size_t)count : 1, sizeof(RommRom));
     if (!arr) {
@@ -264,7 +275,7 @@ static bool parse_roms(const char *body, size_t len, RommRomList *out) {
         return false;
     }
 
-    int child = 1;
+    int child = items + 1;
     int added = 0;
     for (int i = 0; i < count; i++) {
         if (tok[child].type == JSMN_OBJECT) {
@@ -293,8 +304,17 @@ bool romm_fetch_roms(const RommCredentials *c, int platform_id,
                      RommRomList *out, long *http_code, char *err,
                      size_t err_sz) {
     memset(out, 0, sizeof(*out));
-    char path[64];
-    snprintf(path, sizeof(path), "/api/roms?platform_id=%d", platform_id);
+    char path[160];
+    /* platform_ids (plural) is the real query param -- GET /api/roms takes a
+     * repeatable list, matching one value here. limit=10000 (the server's
+     * max) avoids the default page size of 50; the with_* flags turn off
+     * pagination extras (char index, filter values, rom id index, total
+     * count) this client has no use for and that only inflate the response. */
+    snprintf(path, sizeof(path),
+            "/api/roms?platform_ids=%d&limit=10000"
+            "&with_char_index=false&with_filter_values=false"
+            "&with_rom_id_index=false&with_total=false",
+            platform_id);
     size_t len = 0;
     char *body = romm_get(c, path, http_code, err, err_sz, &len);
     if (!body) {
@@ -361,11 +381,16 @@ void romm_content_url(const RommCredentials *c, const RommRom *rom, char *out,
 /* RomM slug (fs_slug or slug, as returned by /api/platforms) -> HaulNX
  * console target (one of romfs:/dl_sources.json's "consoles" list). RomM's
  * slugs mostly follow IGDB's; several predate HaulNX's own naming and don't
- * match verbatim, so this is a deliberate table rather than a pass-through.
- * Several HaulNX consoles have no single obvious RomM platform (e.g. "fbneo"
- * is an emulator core, not an IGDB platform) and are intentionally absent --
- * romm_map_platform_console returns NULL for those, same as for any RomM
- * platform this table doesn't recognise. */
+ * match verbatim (e.g. RomM's "ngc"/"segacd"/"sms" vs HaulNX's
+ * "gc"/"sega-cd"/"master-system"), so this is a deliberate table rather than
+ * a pass-through. Cross-checked against rommapp/romm's own canonical slug
+ * enum (backend/handler/metadata/base_handler.py: UniversalPlatformSlug) --
+ * every entry on the left is a real current slug, and every HaulNX target
+ * that has one is reachable by it. "fbneo", "naomi" and "atomiswave" have no
+ * entry because RomM has no matching platform for them (fbneo is an
+ * emulator core, not an IGDB platform; Naomi/Atomiswave aren't in RomM's
+ * platform list at all) -- romm_map_platform_console returns NULL for
+ * those, same as for any RomM platform this table doesn't recognise. */
 typedef struct {
     const char *romm_slug;
     const char *haulnx_target;
@@ -384,77 +409,53 @@ static const RommConsoleMapEntry ROMM_CONSOLE_MAP[] = {
     {"nds", "nds"},
     {"3ds", "3ds"},
     {"ngc", "gc"},
-    {"gamecube", "gc"},
     {"wii", "wii"},
-    {"wii-u", "wiiu"},
     {"wiiu", "wiiu"},
     {"virtualboy", "virtual-boy"},
-    {"virtual-boy", "virtual-boy"},
     {"pokemon-mini", "pokemon-mini"},
     {"g-and-w", "game-and-watch"},
-    {"game-and-watch", "game-and-watch"},
     {"sg1000", "sg-1000"},
-    {"sg-1000", "sg-1000"},
-    {"sega-master-system", "master-system"},
-    {"master-system", "master-system"},
+    {"sms", "master-system"},
     {"gamegear", "game-gear"},
-    {"game-gear", "game-gear"},
     {"genesis", "genesis"},
-    {"genesis-slash-megadrive", "genesis"},
-    {"megadrive", "genesis"},
     {"segacd", "sega-cd"},
-    {"sega-cd", "sega-cd"},
     {"sega32", "sega-32x"},
-    {"sega-32x", "sega-32x"},
-    {"32x", "sega-32x"},
     {"saturn", "saturn"},
     {"dc", "dc"},
-    {"dreamcast", "dc"},
     {"psx", "psx"},
-    {"ps", "psx"},
     {"ps2", "ps2"},
     {"psp", "psp"},
     {"tg16", "pc-engine"},
-    {"turbografx16--1", "pc-engine"},
-    {"pc-engine", "pc-engine"},
     {"turbografx-cd", "pc-engine-cd"},
-    {"pc-engine-cd", "pc-engine-cd"},
     {"supergrafx", "supergrafx"},
     {"pc-fx", "pc-fx"},
     {"neogeoaes", "neo-geo"},
     {"neogeomvs", "neo-geo"},
-    {"neo-geo", "neo-geo"},
     {"neo-geo-cd", "neo-geo-cd"},
     {"neo-geo-pocket", "neo-geo-pocket"},
     {"neo-geo-pocket-color", "neo-geo-pocket-color"},
     {"atari2600", "atari-2600"},
-    {"atari-2600", "atari-2600"},
     {"atari5200", "atari-5200"},
-    {"atari-5200", "atari-5200"},
     {"atari7800", "atari-7800"},
-    {"atari-7800", "atari-7800"},
     {"lynx", "atari-lynx"},
-    {"atari-lynx", "atari-lynx"},
     {"jaguar", "atari-jaguar"},
-    {"atari-jaguar", "atari-jaguar"},
     {"wonderswan", "wonderswan"},
     {"wonderswan-color", "wonderswan-color"},
     {"colecovision", "colecovision"},
     {"intellivision", "intellivision"},
-    {"odyssey--1", "odyssey2"},
     {"odyssey-2", "odyssey2"},
-    {"odyssey2", "odyssey2"},
     {"vectrex", "vectrex"},
     {"fairchild-channel-f", "channel-f"},
-    {"channel-f", "channel-f"},
     {"3do", "3do"},
     {"philips-cd-i", "cd-i"},
-    {"cd-i", "cd-i"},
-    {"watara-slash-quickshot-supervision", "supervision"},
     {"supervision", "supervision"},
-    {"atomiswave", "atomiswave"},
-    {"naomi", "naomi"},
     {"arcade", "arcade"},
+    /* No RomM platform exists for these -- deliberately absent, not missed:
+     * "fbneo" is an emulator core, not an IGDB/RomM platform; Naomi and
+     * Atomiswave aren't in RomM's platform list at all (verified against
+     * UniversalPlatformSlug, rommapp/romm's canonical slug enum). A HaulNX
+     * console in this situation just never matches romm_map_platform_console
+     * -- see its doc comment. */
 };
 
 static const char *map_slug(const char *slug) {
