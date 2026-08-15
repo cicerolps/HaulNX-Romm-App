@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cerrno>
 #include <cstdarg>
+#include <cstdlib>
 #include <fstream>
 #include <map>
 #include <set>
@@ -2236,7 +2237,13 @@ void MainApplication::GotoHome() {
                 Repo *rp = &g_cfg.consoles[c].repos[r];
                 const char *cname = g_cfg.consoles[c].console;
                 const char *full = console_full_name(cname);
-                flat_rows.push_back({full ? full : cname, rp->label, cname,
+                std::string lbl = rp->label;
+                if (rp->is_romm) {
+                    lbl += " (";
+                    lbl += tr(S_ROMM);
+                    lbl += ")";
+                }
+                flat_rows.push_back({full ? full : cname, lbl, cname,
                                      rp->pinned, rp->enabled != 0});
             }
         }
@@ -2294,7 +2301,15 @@ void MainApplication::GotoRepos(int ci) {
     for (int idx : g_repos_map) {
         // On/off state as a coloured right-hand chip, matching the flat
         // Browse rows (the console is already in the title, so no icon).
-        this->layout->AddRow2(g->repos[idx].label,
+        // A RomM-linked repo gets a "(RomM)" suffix so it reads apart from
+        // archive.org repos at a glance.
+        std::string lbl = g->repos[idx].label;
+        if (g->repos[idx].is_romm) {
+            lbl += " (";
+            lbl += tr(S_ROMM);
+            lbl += ")";
+        }
+        this->layout->AddRow2(lbl,
                               g->repos[idx].enabled ? tr(S_ON) : tr(S_OFF),
                               g_theme->row_text,
                               onoff_color(g->repos[idx].enabled), -1.0f,
@@ -2308,13 +2323,26 @@ void MainApplication::GotoRepos(int ci) {
 
 void MainApplication::GotoFiles(int ci, int ri, bool force) {
     g_sort_mode = SORT_DEFAULT;
-    g_files_manual = false;
     this->sel_ci = ci;
     this->sel_ri = ri;
     ConsoleGroup *g = &g_cfg.consoles[ci];
     Repo *rp = &g->repos[ri];
-    this->layout->SetTitle(std::string(g->console) + " > " + rp->label);
     this->layout->SetTitleIcon(console_icon(g->console));
+    if (rp->is_romm) {
+        // Linked RomM repo: re-fetch its platform's roms live -- there's no
+        // metadata cache for RomM, so `force` (hard refresh) makes no
+        // difference here, it's always a fresh GET. See RommRomsTick's
+        // romm_roms_from_repo branch for how this differs from the ephemeral
+        // Browse (Y) -> RomM one-off pick.
+        g_files_manual = false;
+        this->romm_roms_from_repo = true;
+        this->layout->SetTitle(std::string(g->console) + " > " + rp->label);
+        this->screen = Screen::Files;
+        this->RommRomsStart(atoi(rp->id), g->target, rp->label);
+        return;
+    }
+    g_files_manual = false;
+    this->layout->SetTitle(std::string(g->console) + " > " + rp->label);
     this->screen = Screen::Files;
     this->StartMetaLoad(rp->id, rp->download_base, g->target, force,
                         FILES_SUBTITLE);
@@ -4045,7 +4073,10 @@ void MainApplication::RaStart() {
     for (int c = 0; c < g_cfg.console_count; c++) {
         for (int r = 0; r < g_cfg.consoles[c].repo_count; r++) {
             Repo *rp = &g_cfg.consoles[c].repos[r];
-            if (rp->enabled && rp->id[0]) {
+            // RomM repos have no archive.org-shaped metadata cache -- their id
+            // is a platform id, and their listing is always fetched live when
+            // opened, so there's nothing here for this refresh to warm.
+            if (rp->enabled && rp->id[0] && !rp->is_romm) {
                 g_ra_ids.push_back(rp->id);
             }
         }
@@ -4296,7 +4327,12 @@ static void run_search_scan(const std::string &query, int scope_ci,
         for (int r = 0; r < g_cfg.consoles[c].repo_count; r++) {
             if (scope_ci >= 0 && scope_ri >= 0 && r != scope_ri) continue;
             Repo *rp = &g_cfg.consoles[c].repos[r];
-            if (!rp->enabled || !rp->id[0]) continue;
+            // RomM repos have no on-disk metadata cache for this scan to walk
+            // (their listing is fetched live, held only in memory) and their
+            // id is a platform id, not an archive.org identifier -- feeding
+            // it to ia_fetch below would just waste a bogus lookup. Skip them;
+            // an archive.org-only console still searches its other repos.
+            if (!rp->enabled || !rp->id[0] || rp->is_romm) continue;
             repos.push_back({rp->id, g_cfg.consoles[c].target,
                              rp->download_base});
         }
@@ -4715,6 +4751,7 @@ void MainApplication::RommTestTick() {
 // GotoPicker(Pending::AddRepo) call exactly when RomM isn't configured, so a
 // user who never touches RomM sees no change at all.
 void MainApplication::OfferAddSource() {
+    this->romm_link_ci = -1; // ephemeral one-off browse, not a repo link
     if (!romm_creds_configured(&g_romm_creds)) {
         this->GotoPicker(Pending::AddRepo);
         return;
@@ -4726,6 +4763,42 @@ void MainApplication::OfferAddSource() {
     if (r == 0) {
         this->GotoPicker(Pending::AddRepo);
     } else if (r == 1) {
+        this->RommPlatformsStart();
+    }
+}
+
+// Screen::Repos' Y (already inside a console): the archive.org add-repo
+// prompt, factored out so OfferLinkRommRepo can fall back to it unchanged.
+void MainApplication::AddArchiveRepoPrompt(int ci) {
+    ConsoleGroup *g = &g_cfg.consoles[ci];
+    char nm[64] = {0}, id[256] = {0};
+    if (prompt(tr(S_HINT_NAME), nullptr, nm, sizeof(nm)) &&
+        prompt(tr(S_HINT_ARCHIVE_ID), nullptr, id, sizeof(id))) {
+        if (config_add_repo(g, nm, id)) {
+            config_save(&g_cfg);
+            this->Toast(tr(S_ADDED));
+        }
+    }
+    this->GotoRepos(ci);
+}
+
+// Screen::Repos' own Y: offer archive.org vs RomM exactly like OfferAddSource
+// does on Home, but a RomM pick here links the chosen platform to THIS
+// console as a persisted repo (romm_link_ci >= ci) instead of an ephemeral
+// one-off browse -- see Screen::RommPlatformPicker's A-press handler.
+void MainApplication::OfferLinkRommRepo(int ci) {
+    if (!romm_creds_configured(&g_romm_creds)) {
+        this->AddArchiveRepoPrompt(ci);
+        return;
+    }
+    int r = this->CreateShowDialog(
+        tr(S_ADD_SOURCE_TITLE), tr(S_ADD_SOURCE_BODY),
+        {tr(S_SOURCE_ARCHIVE_ORG), tr(S_SOURCE_ROMM), tr(S_CANCEL)}, false, {},
+        style_dialog);
+    if (r == 0) {
+        this->AddArchiveRepoPrompt(ci);
+    } else if (r == 1) {
+        this->romm_link_ci = ci;
         this->RommPlatformsStart();
     }
 }
@@ -4766,7 +4839,11 @@ void MainApplication::RommPlatformsTick() {
                 this->romm_platforms_err);
         this->CreateShowDialog(tr(S_ROMM), body, {tr(S_OK)}, true, {},
                                style_dialog);
-        this->GotoHome();
+        if (this->romm_link_ci >= 0) {
+            this->GotoRepos(this->romm_link_ci);
+        } else {
+            this->GotoHome();
+        }
         return;
     }
     this->GotoRommPlatformPicker();
@@ -4871,7 +4948,14 @@ void MainApplication::RommRomsTick() {
         snprintf(body, sizeof(body), tr(S_ROMM_TEST_FAIL), this->romm_roms_err);
         this->CreateShowDialog(tr(S_ROMM), body, {tr(S_OK)}, true, {},
                                style_dialog);
-        this->GotoRommPlatformPicker();
+        if (this->romm_roms_from_repo) {
+            // Linked repo: same failure destination as an archive.org repo
+            // whose metadata fetch fails -- back to this console's repo list,
+            // not the (ephemeral-only) platform picker.
+            this->GotoRepos(this->sel_ci);
+        } else {
+            this->GotoRommPlatformPicker();
+        }
         return;
     }
     if (g_have_item) {
@@ -4882,7 +4966,10 @@ void MainApplication::RommRomsTick() {
     romm_free_roms(&g_romm_roms_list);
     g_have_item = true;
     g_files_is_romm = true;
-    g_files_manual = true; // no "repo" to cycle through, same as a pasted URL
+    // Linked repo behaves like any archive.org repo (B returns to Repos,
+    // Left/Right cycles repos); the ephemeral one-off browse has no repo to
+    // go back to, same as a pasted URL.
+    g_files_manual = !this->romm_roms_from_repo;
     snprintf(g_files_id, sizeof(g_files_id), "romm:%d",
             this->romm_roms_platform_id);
     g_files_base[0] = '\0'; // unused: every file carries its own url_override
@@ -4891,7 +4978,9 @@ void MainApplication::RommRomsTick() {
     g_filter.clear();
     g_sel.clear();
     rebuild_files(this->layout.get(), g_files_target);
-    this->layout->SetTitle(this->romm_roms_display_name);
+    if (!this->romm_roms_from_repo) {
+        this->layout->SetTitle(this->romm_roms_display_name);
+    }
     this->layout->SetSubtitle(FILES_SUBTITLE);
     this->screen = Screen::Files;
 }
@@ -5401,12 +5490,25 @@ void MainApplication::GotoRepoEdit(int ci, int ri) {
     snprintf(r, sizeof(r), tr(S_LABEL_NAME),
              rp->label[0] ? rp->label : tr(S_UNSET));
     this->layout->AddRow(r);
-    snprintf(r, sizeof(r), tr(S_LABEL_ARCHIVE_ID),
-             rp->id[0] ? rp->id : tr(S_UNSET));
-    this->layout->AddRow(r);
-    snprintf(r, sizeof(r), tr(S_LABEL_DOWNLOAD_URL),
-             rp->download_base[0] ? rp->download_base : tr(S_AUTO));
-    this->layout->AddRow(r);
+    if (rp->is_romm) {
+        // Rows 1-2 stay in place (so 3-5 below need no index changes) but show
+        // RomM-appropriate, non-editable info instead of the archive.org
+        // fields -- see the S_ROMM_REPO_FIELD_LOCKED guard in the A-handler.
+        snprintf(r, sizeof(r), tr(S_LABEL_ROMM_PLATFORM_ID),
+                 rp->id[0] ? rp->id : tr(S_UNSET));
+        this->layout->AddRow(r);
+        char host[256];
+        romm_server_authority(g_romm_creds.server_url, host, sizeof(host));
+        snprintf(r, sizeof(r), tr(S_LABEL_ROMM_SOURCE), host);
+        this->layout->AddRow(r);
+    } else {
+        snprintf(r, sizeof(r), tr(S_LABEL_ARCHIVE_ID),
+                 rp->id[0] ? rp->id : tr(S_UNSET));
+        this->layout->AddRow(r);
+        snprintf(r, sizeof(r), tr(S_LABEL_DOWNLOAD_URL),
+                 rp->download_base[0] ? rp->download_base : tr(S_AUTO));
+        this->layout->AddRow(r);
+    }
     snprintf(r, sizeof(r), tr(S_LABEL_ENABLED),
              rp->enabled ? tr(S_ON) : tr(S_OFF));
     this->layout->AddRow(r);                     // 3
@@ -6424,15 +6526,7 @@ void MainApplication::HandleInput(u64 down, u64 held,
         } else if ((down & HidNpadButton_X) && g->repo_count > 0) {
             this->GotoRepoEdit(this->sel_ci, repos_ref(this->layout->Sel()));
         } else if (down & HidNpadButton_Y) {
-            char nm[64] = {0}, id[256] = {0};
-            if (prompt(tr(S_HINT_NAME), nullptr, nm, sizeof(nm)) &&
-                prompt(tr(S_HINT_ARCHIVE_ID), nullptr, id, sizeof(id))) {
-                if (config_add_repo(g, nm, id)) {
-                    config_save(&g_cfg);
-                    this->Toast(tr(S_ADDED));
-                }
-            }
-            this->GotoRepos(this->sel_ci);
+            this->OfferLinkRommRepo(this->sel_ci);
         } else if (down & HidNpadButton_Minus) {
             // Search across every repo in this console. (Repo deletion now lives
             // in the edit screen, X.)
@@ -6492,8 +6586,11 @@ void MainApplication::HandleInput(u64 down, u64 held,
                     this->ToastErr(tr(S_QUEUE_FULL));
                 }
             }
-        } else if ((down & HidNpadButton_Minus) && !g_files_manual) {
-            // Search within the opened repo.
+        } else if ((down & HidNpadButton_Minus) && !g_files_manual &&
+                   !g_files_is_romm) {
+            // Search within the opened repo. Not offered for a RomM repo --
+            // its listing is live/in-memory, not on the disk cache this scan
+            // walks (see run_search_scan's is_romm skip).
             char q[256] = {0};
             if (prompt_raw(tr(S_SEARCH_REPO), nullptr, q, sizeof(q)) && q[0]) {
                 this->GotoSearch(q, this->sel_ci, this->sel_ri);
@@ -7816,6 +7913,10 @@ void MainApplication::HandleInput(u64 down, u64 held,
                 }
                 break;
             case 1:
+                if (rp->is_romm) {
+                    this->ToastErr(tr(S_ROMM_REPO_FIELD_LOCKED));
+                    break;
+                }
                 if (prompt(tr(S_HINT_ARCHIVE_ID), rp->id, v, sizeof(v))) {
                     snprintf(rp->id, sizeof(rp->id), "%s", v);
                     rp->download_base[0] = '\0';
@@ -7824,6 +7925,10 @@ void MainApplication::HandleInput(u64 down, u64 held,
                 }
                 break;
             case 2:
+                if (rp->is_romm) {
+                    this->ToastErr(tr(S_ROMM_REPO_FIELD_LOCKED));
+                    break;
+                }
                 if (prompt(tr(S_HINT_DOWNLOAD_URL), rp->download_base, v, sizeof(v))) {
                     snprintf(rp->download_base, sizeof(rp->download_base), "%s",
                              v);
@@ -8116,20 +8221,42 @@ void MainApplication::HandleInput(u64 down, u64 held,
 
     case Screen::RommPlatformPicker: {
         if (down & HidNpadButton_B) {
-            this->GotoHome();
+            if (this->romm_link_ci >= 0) {
+                this->GotoRepos(this->romm_link_ci);
+            } else {
+                this->GotoHome();
+            }
         } else if (down & HidNpadButton_A) {
             s32 i = this->layout->Sel();
             if (i >= 0 && i < (s32)g_romm_platform_order.size()) {
                 const RommPlatform &p =
                     g_romm_platform_list.platforms[g_romm_platform_order[i]];
-                const char *target = romm_map_platform_console(&p);
-                if (!target) {
-                    this->CreateShowDialog(tr(S_ROMM),
-                                           tr(S_ROMM_PLATFORM_UNMAPPED),
-                                           {tr(S_OK)}, true, {}, style_dialog);
+                if (this->romm_link_ci >= 0) {
+                    // Linking mode (Screen::Repos' own Y): persist this
+                    // platform as a repo of the console we came from instead
+                    // of an ephemeral one-off browse. The repo's target
+                    // folder is that console's target, same as every
+                    // archive.org repo -- no need for
+                    // romm_map_platform_console here, the user is explicitly
+                    // choosing which RomM library feeds this console.
+                    ConsoleGroup *g = &g_cfg.consoles[this->romm_link_ci];
+                    const char *label = p.name[0] ? p.name : p.slug;
+                    if (config_add_romm_repo(g, label, p.id)) {
+                        config_save(&g_cfg);
+                        this->Toast(tr(S_ADDED));
+                    }
+                    this->GotoRepos(this->romm_link_ci);
                 } else {
-                    this->RommRomsStart(p.id, target,
-                                        p.name[0] ? p.name : p.slug);
+                    const char *target = romm_map_platform_console(&p);
+                    if (!target) {
+                        this->CreateShowDialog(
+                            tr(S_ROMM), tr(S_ROMM_PLATFORM_UNMAPPED),
+                            {tr(S_OK)}, true, {}, style_dialog);
+                    } else {
+                        this->romm_roms_from_repo = false;
+                        this->RommRomsStart(p.id, target,
+                                            p.name[0] ? p.name : p.slug);
+                    }
                 }
             }
         }

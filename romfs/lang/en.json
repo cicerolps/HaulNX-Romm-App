@@ -215,6 +215,9 @@
   "sub_romm_platforms": "A select  B back",
   "n_roms": "%d roms",
   "romm_platform_unmapped": "This RomM platform has no matching HaulNX console.",
+  "label_romm_platform_id": "RomM Platform ID: %s",
+  "label_romm_source": "Source: RomM (%s)",
+  "romm_repo_field_locked": "Not editable for a RomM repository",
 
   "title_update": "Update",
   "update_fetch_fail": "Could not fetch release info.",

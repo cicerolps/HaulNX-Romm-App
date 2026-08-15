@@ -71,13 +71,28 @@ extern "C" {
  * their emulators here (see the wiki); we no longer read any emulator's config. */
 #define DEFAULT_ROMS_ROOT  "sdmc:/roms"
 
-/* One download source (an archive.org item) within a console group. */
+/* One download source within a console group: either an archive.org item, or
+ * (is_romm) a RomM platform linked from that instance's live library. */
 typedef struct {
     char label[64];          /* repo display name, e.g. "No-Intro" */
-    char id[256];            /* archive.org item id */
-    char download_base[512]; /* base URL; defaults to .../download/<id> */
+    /* archive.org item id, or (is_romm) the RomM platform id as a decimal
+     * string, e.g. "42" — reused rather than adding a separate field, since a
+     * repo is always exactly one or the other. */
+    char id[256];
+    char download_base[512]; /* archive.org only: base URL, defaults to
+                                .../download/<id>. Always empty for a RomM
+                                repo (see repo_set_url_default) -- its
+                                download URL is per-file, built fresh by
+                                romm_content_url each time the repo opens. */
     bool enabled;            /* "active" flag */
     bool pinned;             /* pinned/favorite — sorted to top of browse */
+    /* true = a RomM-linked repo (id holds a platform id, fetched live from
+     * the configured RomM instance every time it's opened -- there is no
+     * metadata cache for it, unlike archive.org's). false (the default, and
+     * what every repo in a dl_sources.json written before this field existed
+     * decodes to) = an ordinary archive.org repo, entirely unaffected by any
+     * of this. */
+    bool is_romm;
 } Repo;
 
 /* A console (e.g. "snes") that groups one or more download repos. All of a
@@ -250,10 +265,17 @@ bool config_restore_backup(SourcesConfig *cfg, int slot, int *out_consoles,
 /* Append a repo to a console. Returns the new repo, or NULL if full. */
 Repo *config_add_repo(ConsoleGroup *g, const char *label, const char *id);
 
+/* Append a repo backed by a RomM platform to a console, marking it is_romm
+ * and storing platform_id (as a decimal string) as the repo's id -- see
+ * Repo.is_romm. Returns the new repo, or NULL if full. */
+Repo *config_add_romm_repo(ConsoleGroup *g, const char *label,
+                          int platform_id);
+
 /* Remove the repo at index idx within a console. Returns true if removed. */
 bool config_remove_repo(ConsoleGroup *g, int idx);
 
-/* Fill repo->download_base from its id if it is empty. */
+/* Fill repo->download_base from its id if it is empty. No-op for a RomM repo
+ * (Repo.is_romm) -- it has no archive.org-shaped download_base to default. */
 void repo_set_url_default(Repo *r);
 
 /* Credentials (archive.org S3 access/secret). */

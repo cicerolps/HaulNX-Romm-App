@@ -765,6 +765,18 @@ class MainApplication : public pu::ui::Application {
     int romm_roms_platform_id = 0;
     std::string romm_roms_target;
     std::string romm_roms_display_name;
+    /* -1 (the default): the roms/platforms fetch in flight is the ephemeral
+     * Browse (Y) one-off browse. >= 0: it's linking a RomM platform to this
+     * console index as a persisted repo (Screen::Repos' own Y), or (via
+     * GotoFiles) re-fetching an already-linked repo's roms -- see
+     * OfferLinkRommRepo/Screen::RommPlatformPicker's A-press handler. */
+    int romm_link_ci = -1;
+    /* True when the current romm_roms fetch is for an already-linked repo
+     * (opened via GotoFiles) rather than a fresh platform pick -- decides
+     * whether RommRomsTick treats the resulting Files listing like a normal
+     * repo (g_files_manual=false, B returns to Screen::Repos) or like the
+     * ephemeral one-off browse (g_files_manual=true, B returns to Home). */
+    bool romm_roms_from_repo = false;
 
     // Background bulk metadata refresh (Manage data -> Refresh all metadata):
     // force-fetches every enabled repo's file list, with live (n/total)
@@ -908,6 +920,14 @@ class MainApplication : public pu::ui::Application {
                        const std::string &display_name);
     void RommRomsTick(); // poll the roms GET; populate g_item and open Files
     static void RommRomsThread(void *arg);
+    // Screen::Repos' own Y (already inside a console): offer archive.org vs
+    // RomM the same way OfferAddSource does on Home, but linking a picked
+    // RomM platform to THIS console as a persisted repo instead of an
+    // ephemeral one-off browse -- see romm_link_ci.
+    void OfferLinkRommRepo(int ci);
+    // The prompt-for-name-then-id archive.org add flow, factored out of
+    // Screen::Repos' Y-handler so OfferLinkRommRepo can fall back to it.
+    void AddArchiveRepoPrompt(int ci);
     void GotoDlPrefs();
     void GotoRomPicker(const std::string &path);
     void GotoAppearance();

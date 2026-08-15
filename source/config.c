@@ -172,6 +172,9 @@ static void seed_console_groups(SourcesConfig *cfg) {
 }
 
 void repo_set_url_default(Repo *r) {
+    if (r->is_romm) {
+        return; /* no archive.org-shaped download_base for a RomM repo */
+    }
     if (!r->download_base[0] && r->id[0]) {
         char tmp[512];
         snprintf(tmp, sizeof(tmp), "https://archive.org/download/%s", r->id);
@@ -308,6 +311,22 @@ Repo *config_add_repo(ConsoleGroup *g, const char *label, const char *id) {
     return r;
 }
 
+Repo *config_add_romm_repo(ConsoleGroup *g, const char *label,
+                           int platform_id) {
+    if (!g || g->repo_count >= MAX_REPOS) {
+        return NULL;
+    }
+    Repo *r = &g->repos[g->repo_count++];
+    memset(r, 0, sizeof(*r));
+    char idbuf[32];
+    snprintf(idbuf, sizeof(idbuf), "%d", platform_id);
+    sset(r->label, sizeof(r->label), (label && label[0]) ? label : idbuf);
+    sset(r->id, sizeof(r->id), idbuf);
+    r->enabled = true;
+    r->is_romm = true;
+    return r;
+}
+
 bool config_remove_repo(ConsoleGroup *g, int idx) {
     if (!g || idx < 0 || idx >= g->repo_count) {
         return false;
@@ -331,6 +350,10 @@ static bool parse_repo(const char *js, jsmntok_t *tok, int obj, Repo *r) {
     r->enabled = json_bool(js, tok, json_obj_get(js, tok, obj, "active"));
     int pi = json_obj_get(js, tok, obj, "pinned");
     r->pinned = (pi >= 0) ? json_bool(js, tok, pi) : false;
+    /* Absent "is_romm" defaults to false -- every repo in a dl_sources.json
+     * written before this field existed. */
+    int rmtok = json_obj_get(js, tok, obj, "is_romm");
+    r->is_romm = (rmtok >= 0) ? json_bool(js, tok, rmtok) : false;
     if (!r->label[0]) {
         sset(r->label, sizeof(r->label), r->id);
     }
@@ -702,9 +725,10 @@ bool config_save(const SourcesConfig *cfg) {
             json_write_escaped(f, rp->id);
             fputs(", \"URL\": ", f);
             json_write_escaped(f, rp->download_base);
-            fprintf(f, ", \"active\": %s, \"pinned\": %s }",
+            fprintf(f, ", \"active\": %s, \"pinned\": %s, \"is_romm\": %s }",
                     rp->enabled ? "true" : "false",
-                    rp->pinned ? "true" : "false");
+                    rp->pinned ? "true" : "false",
+                    rp->is_romm ? "true" : "false");
             fputs(r + 1 < g->repo_count ? ",\n" : "\n", f);
         }
         fputs("      ]\n    }", f);
