@@ -78,6 +78,19 @@ bool romm_test_connection(const RommCredentials *c, long *http_code, char *err,
 void romm_content_url(const RommCredentials *c, const RommRom *rom, char *out,
                       size_t out_sz);
 
+/*
+ * Map a RomM platform to a HaulNX console (target) — one of the strings
+ * romfs:/dl_sources.json ships in its "consoles" list, e.g. "snes", "n64",
+ * "sega-32x". Tries platform->fs_slug then platform->slug against a static
+ * table (RomM's slugs mostly follow IGDB's, which HaulNX's own targets
+ * predate and don't always match verbatim -- e.g. RomM's "ngc"/"segacd" vs
+ * HaulNX's "gc"/"sega-cd"). Returns NULL if the platform has no known HaulNX
+ * console; callers must treat that as "unsupported" rather than guessing a
+ * folder -- callers should log/report the platform as unsupported rather
+ * than guessing one.
+ */
+const char *romm_map_platform_console(const RommPlatform *p);
+
 #ifdef __cplusplus
 }
 #endif

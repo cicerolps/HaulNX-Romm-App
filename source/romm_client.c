@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 
 /* ---- credential setup -------------------------------------------------- */
 
@@ -301,4 +302,126 @@ void romm_content_url(const RommCredentials *c, const RommRom *rom, char *out,
     url_encode_component(rom->fs_name, enc, sizeof(enc));
     snprintf(out, out_sz, "%s/api/roms/%d/content/%s", c->server_url, rom->id,
             enc);
+}
+
+/* ---- platform -> HaulNX console mapping --------------------------------- */
+
+/* RomM slug (fs_slug or slug, as returned by /api/platforms) -> HaulNX
+ * console target (one of romfs:/dl_sources.json's "consoles" list). RomM's
+ * slugs mostly follow IGDB's; several predate HaulNX's own naming and don't
+ * match verbatim, so this is a deliberate table rather than a pass-through.
+ * Several HaulNX consoles have no single obvious RomM platform (e.g. "fbneo"
+ * is an emulator core, not an IGDB platform) and are intentionally absent --
+ * romm_map_platform_console returns NULL for those, same as for any RomM
+ * platform this table doesn't recognise. */
+typedef struct {
+    const char *romm_slug;
+    const char *haulnx_target;
+} RommConsoleMapEntry;
+
+static const RommConsoleMapEntry ROMM_CONSOLE_MAP[] = {
+    {"nes", "nes"},
+    {"famicom", "nes"},
+    {"fds", "fds"},
+    {"snes", "snes"},
+    {"sfam", "snes"},
+    {"n64", "n64"},
+    {"gb", "gb"},
+    {"gbc", "gbc"},
+    {"gba", "gba"},
+    {"nds", "nds"},
+    {"3ds", "3ds"},
+    {"ngc", "gc"},
+    {"gamecube", "gc"},
+    {"wii", "wii"},
+    {"wii-u", "wiiu"},
+    {"wiiu", "wiiu"},
+    {"virtualboy", "virtual-boy"},
+    {"virtual-boy", "virtual-boy"},
+    {"pokemon-mini", "pokemon-mini"},
+    {"g-and-w", "game-and-watch"},
+    {"game-and-watch", "game-and-watch"},
+    {"sg1000", "sg-1000"},
+    {"sg-1000", "sg-1000"},
+    {"sega-master-system", "master-system"},
+    {"master-system", "master-system"},
+    {"gamegear", "game-gear"},
+    {"game-gear", "game-gear"},
+    {"genesis", "genesis"},
+    {"genesis-slash-megadrive", "genesis"},
+    {"megadrive", "genesis"},
+    {"segacd", "sega-cd"},
+    {"sega-cd", "sega-cd"},
+    {"sega32", "sega-32x"},
+    {"sega-32x", "sega-32x"},
+    {"32x", "sega-32x"},
+    {"saturn", "saturn"},
+    {"dc", "dc"},
+    {"dreamcast", "dc"},
+    {"psx", "psx"},
+    {"ps", "psx"},
+    {"ps2", "ps2"},
+    {"psp", "psp"},
+    {"tg16", "pc-engine"},
+    {"turbografx16--1", "pc-engine"},
+    {"pc-engine", "pc-engine"},
+    {"turbografx-cd", "pc-engine-cd"},
+    {"pc-engine-cd", "pc-engine-cd"},
+    {"supergrafx", "supergrafx"},
+    {"pc-fx", "pc-fx"},
+    {"neogeoaes", "neo-geo"},
+    {"neogeomvs", "neo-geo"},
+    {"neo-geo", "neo-geo"},
+    {"neo-geo-cd", "neo-geo-cd"},
+    {"neo-geo-pocket", "neo-geo-pocket"},
+    {"neo-geo-pocket-color", "neo-geo-pocket-color"},
+    {"atari2600", "atari-2600"},
+    {"atari-2600", "atari-2600"},
+    {"atari5200", "atari-5200"},
+    {"atari-5200", "atari-5200"},
+    {"atari7800", "atari-7800"},
+    {"atari-7800", "atari-7800"},
+    {"lynx", "atari-lynx"},
+    {"atari-lynx", "atari-lynx"},
+    {"jaguar", "atari-jaguar"},
+    {"atari-jaguar", "atari-jaguar"},
+    {"wonderswan", "wonderswan"},
+    {"wonderswan-color", "wonderswan-color"},
+    {"colecovision", "colecovision"},
+    {"intellivision", "intellivision"},
+    {"odyssey--1", "odyssey2"},
+    {"odyssey-2", "odyssey2"},
+    {"odyssey2", "odyssey2"},
+    {"vectrex", "vectrex"},
+    {"fairchild-channel-f", "channel-f"},
+    {"channel-f", "channel-f"},
+    {"3do", "3do"},
+    {"philips-cd-i", "cd-i"},
+    {"cd-i", "cd-i"},
+    {"watara-slash-quickshot-supervision", "supervision"},
+    {"supervision", "supervision"},
+    {"atomiswave", "atomiswave"},
+    {"naomi", "naomi"},
+    {"arcade", "arcade"},
+};
+
+static const char *map_slug(const char *slug) {
+    if (!slug || !slug[0]) {
+        return NULL;
+    }
+    size_t n = sizeof(ROMM_CONSOLE_MAP) / sizeof(ROMM_CONSOLE_MAP[0]);
+    for (size_t i = 0; i < n; i++) {
+        if (strcasecmp(slug, ROMM_CONSOLE_MAP[i].romm_slug) == 0) {
+            return ROMM_CONSOLE_MAP[i].haulnx_target;
+        }
+    }
+    return NULL;
+}
+
+const char *romm_map_platform_console(const RommPlatform *p) {
+    const char *t = map_slug(p->fs_slug);
+    if (t) {
+        return t;
+    }
+    return map_slug(p->slug);
 }
