@@ -72,7 +72,7 @@ bool net_url_host_eq(const char *url, const char *host);
  * reason to redirect, and not following one closes off any question of where
  * the credential could end up. verify_tls=false skips TLS certificate
  * verification, for a self-signed/LAN certificate. Returns NULL on transport
- * error; *http_code/*out_len are filled if non-NULL.
+ * error; *http_code / *out_len are filled if non-NULL.
  */
 char *http_get_authed(const char *url, const char *auth_host,
                       const char *user, const char *pass,
