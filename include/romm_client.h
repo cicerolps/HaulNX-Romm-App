@@ -78,6 +78,12 @@ bool romm_test_connection(const RommCredentials *c, long *http_code, char *err,
 void romm_content_url(const RommCredentials *c, const RommRom *rom, char *out,
                       size_t out_sz);
 
+/* The bare host[:port] authority of a RomM server_url (e.g. "192.168.1.10:8080"
+ * from "http://192.168.1.10:8080") -- the auth_host queue_add_ex and
+ * http_get_authed/http_download_authed expect. server_url is always stored
+ * without a trailing slash (see romm_creds_load/save). */
+void romm_server_authority(const char *server_url, char *out, size_t out_sz);
+
 /* Build a raw "authorization: ..." header line for the download queue
  * (queue_add_ex's auth param): "Bearer <token>" when an API token is set
  * (priority, matching romm_creds_configured), else HTTP Basic

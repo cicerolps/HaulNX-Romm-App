@@ -583,6 +583,7 @@ class MainApplication : public pu::ui::Application {
         Manage,   // show/hide consoles on the Browse page
         Creds,    // archive.org credentials editor
         RommCreds, // RomM credentials editor (second download source)
+        RommPlatformPicker, // Browse (Y) -> RomM: pick a platform, live from /api/platforms
         DlPrefs,  // Downloads settings (concurrency/rate/skip/keep-awake)
         Appearance, // Appearance settings (theme/cards/group/language)
         ExtFilter, // Browse file-view extension filter editor
@@ -744,6 +745,27 @@ class MainApplication : public pu::ui::Application {
     long romm_test_http_code = 0;   // 0 = transport-level failure, not an HTTP response
     char romm_test_err[160] = "";   // short, plain-English reason on failure
 
+    // Background RomM platform list (Browse -> Y -> RomM): GET /api/platforms,
+    // same shape as romm_test above. Result lands in the g_romm_platform_list
+    // global (like archive.org metadata lands in g_item) -- see
+    // RommPlatformsThread.
+    BgTask romm_platforms;
+    std::atomic<bool> romm_platforms_ok{false};
+    long romm_platforms_http_code = 0;
+    char romm_platforms_err[160] = "";
+
+    // Background RomM rom list for one platform (after it's picked): GET
+    // /api/roms?platform_id=. romm_roms_platform_id/target/display_name are
+    // set by RommRomsStart before the thread runs, same as StartMetaLoad's
+    // g_files_id/g_files_target for archive.org.
+    BgTask romm_roms;
+    std::atomic<bool> romm_roms_ok{false};
+    long romm_roms_http_code = 0;
+    char romm_roms_err[160] = "";
+    int romm_roms_platform_id = 0;
+    std::string romm_roms_target;
+    std::string romm_roms_display_name;
+
     // Background bulk metadata refresh (Manage data -> Refresh all metadata):
     // force-fetches every enabled repo's file list, with live (n/total)
     // progress and B to cancel between repos.
@@ -875,6 +897,17 @@ class MainApplication : public pu::ui::Application {
     void RommTestStart();   // kick off the background "Test connection" GET
     void RommTestTick();    // poll it; show the result when done
     static void RommTestThread(void *arg);
+    // Browse (Y): offer archive.org vs RomM when RomM is configured, else go
+    // straight to the archive.org console picker (today's only behavior).
+    void OfferAddSource();
+    void RommPlatformsStart(); // kick off the background /api/platforms GET
+    void RommPlatformsTick();  // poll it; open the picker or report the error
+    static void RommPlatformsThread(void *arg);
+    void GotoRommPlatformPicker();
+    void RommRomsStart(int platform_id, const std::string &target,
+                       const std::string &display_name);
+    void RommRomsTick(); // poll the roms GET; populate g_item and open Files
+    static void RommRomsThread(void *arg);
     void GotoDlPrefs();
     void GotoRomPicker(const std::string &path);
     void GotoAppearance();

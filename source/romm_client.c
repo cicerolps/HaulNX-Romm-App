@@ -38,7 +38,7 @@ static bool romm_auth_pick(const RommCredentials *c, const char **user,
  * auth_host (the exact host the credential may be sent to). server_url is
  * always stored without a trailing slash (see romm_creds_load/save), so this
  * is just the part between "://" and the next '/' or end of string. */
-static void romm_authority(const char *server_url, char *out, size_t out_sz) {
+void romm_server_authority(const char *server_url, char *out, size_t out_sz) {
     out[0] = '\0';
     const char *p = strstr(server_url, "://");
     if (!p) {
@@ -129,8 +129,8 @@ void romm_creds_queue_auth_header(const RommCredentials *c, char *out,
 
 /* One GET against the RomM API: builds the URL (server_url + path), attaches
  * whichever credential is configured (scoped to the RomM host only --
- * romm_authority/http_get_authed keep it from ever reaching archive.org),
- * and reports a short, plain-English reason on failure. */
+ * romm_server_authority/http_get_authed keep it from ever reaching
+ * archive.org), and reports a short, plain-English reason on failure. */
 static char *romm_get(const RommCredentials *c, const char *path,
                       long *http_code, char *err, size_t err_sz,
                       size_t *out_len) {
@@ -151,7 +151,7 @@ static char *romm_get(const RommCredentials *c, const char *path,
     char url[600];
     snprintf(url, sizeof(url), "%s%s", c->server_url, path);
     char authority[256];
-    romm_authority(c->server_url, authority, sizeof(authority));
+    romm_server_authority(c->server_url, authority, sizeof(authority));
 
     const char *user = NULL, *pass = NULL;
     char bearer[160];

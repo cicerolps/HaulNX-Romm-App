@@ -39,6 +39,16 @@ static RommCredentials g_romm_creds;
 // run and failed, not merely because the connection has never been tested.
 static bool g_romm_tested = false;
 static bool g_romm_last_test_ok = false;
+// Live platform list from Browse -> Y -> RomM (RommPlatformsThread), and the
+// display order the picker shows them in (indices into
+// g_romm_platform_list.platforms, sorted by name -- mirrors g_picker's role
+// for the archive.org console picker).
+static RommPlatformList g_romm_platform_list = {NULL, 0};
+static std::vector<int> g_romm_platform_order;
+// Scratch for the roms fetch (RommRomsThread): converted into g_item/g_files
+// (see romm_roms_to_archive_item) and freed immediately, so it never needs to
+// survive past RommRomsTick.
+static RommRomList g_romm_roms_list = {NULL, 0};
 static Prefs g_prefs;
 static TicoState g_tico;
 static ArchiveItem g_item;
@@ -61,6 +71,12 @@ static char g_files_id[256], g_files_base[512], g_files_target[64];
 // on the UI thread). g_dl_md5 (below) holds the md5 side.
 static std::vector<std::string> g_inst_idx;
 static bool g_files_manual = false;
+// True when the current Files listing (g_item) came from RomM instead of
+// archive.org -- decides which credential enqueueing attaches (see
+// queue_add_current_source). g_files_manual is also set true for a RomM
+// listing (it has no "repo" to cycle through either, same as a pasted
+// archive.org URL), but that flag alone can't tell the two apart.
+static bool g_files_is_romm = false;
 
 #define FILES_SUBTITLE tr(S_SUB_FILES)
 
@@ -848,6 +864,7 @@ void MainApplication::StartMetaLoad(const std::string &id,
         g_have_item = false;
         this->meta_discard = false;
     }
+    g_files_is_romm = false; // every StartMetaLoad caller is archive.org
     snprintf(g_files_id, sizeof(g_files_id), "%s", id.c_str());
     snprintf(g_files_base, sizeof(g_files_base), "%s", base.c_str());
     snprintf(g_files_target, sizeof(g_files_target), "%s", target.c_str());
@@ -1906,6 +1923,29 @@ static const char *install_folder_for(const char *target) {
     return g_prefs.custom_folders ? config_console_folder(&g_cfg, target) : "";
 }
 
+// Enqueue a file from the currently-open Files listing (g_item), attaching
+// whichever provider's credential actually applies: archive.org's (the
+// default) or RomM's, when the listing came from RomM (g_files_is_romm) --
+// see romm_creds_queue_auth_header/queue_add_ex's doc comments for why RomM
+// needs its own queue_add variant instead of archive.org's queue_add.
+static bool queue_add_current_source(const char *url, const char *name,
+                                     const char *target, uint64_t size,
+                                     bool is_archive, const char *md5,
+                                     const char *dest) {
+    if (g_files_is_romm) {
+        char auth[400];
+        romm_creds_queue_auth_header(&g_romm_creds, auth, sizeof(auth));
+        char host[256];
+        romm_server_authority(g_romm_creds.server_url, host, sizeof(host));
+        return queue_add_ex(url, name, target, auth, host,
+                            !g_romm_creds.ignore_cert_verify, size, is_archive,
+                            md5, dest);
+    }
+    char auth[320];
+    creds_auth_header(&g_creds, auth, sizeof(auth));
+    return queue_add(url, name, target, auth, size, is_archive, md5, dest);
+}
+
 // A with files marked: queue the whole selection, but total it up first. Every
 // size here comes from the repo metadata, so the count, the bytes and what will
 // actually fit are all known before a single byte is transferred.
@@ -2023,8 +2063,6 @@ void MainApplication::QueueSelection() {
     }
 
     const int want = counts[r];
-    char auth[320];
-    creds_auth_header(&g_creds, auth, sizeof(auth));
     int done = 0;
     // One queue-state write for the whole batch: queue_add persists on every
     // call, so without this, queueing N items rewrites the file N times.
@@ -2038,9 +2076,9 @@ void MainApplication::QueueSelection() {
         ArchiveFile *f = &g_item.files[add[i]];
         char url[1024];
         ia_file_url(&g_item, f, url, sizeof(url));
-        if (!queue_add(url, f->name, g_files_target, auth, f->size,
-                       is_archive_name(f->name), f->md5,
-                       install_folder_for(g_files_target))) {
+        if (!queue_add_current_source(url, f->name, g_files_target, f->size,
+                                      is_archive_name(f->name), f->md5,
+                                      install_folder_for(g_files_target))) {
             break; // queue filled under us; report what did land
         }
         g_sel.erase(add[i]); // queued items drop out of the selection
@@ -4671,6 +4709,193 @@ void MainApplication::RommTestTick() {
     this->layout->SetSel(keep);
 }
 
+// Browse (Y): archive.org's console picker is the only option unless RomM is
+// configured, in which case offer a choice -- see the doc's "oferecer RomM
+// como opção de fonte ao lado de archive.org". Matches the pre-existing
+// GotoPicker(Pending::AddRepo) call exactly when RomM isn't configured, so a
+// user who never touches RomM sees no change at all.
+void MainApplication::OfferAddSource() {
+    if (!romm_creds_configured(&g_romm_creds)) {
+        this->GotoPicker(Pending::AddRepo);
+        return;
+    }
+    int r = this->CreateShowDialog(
+        tr(S_ADD_SOURCE_TITLE), tr(S_ADD_SOURCE_BODY),
+        {tr(S_SOURCE_ARCHIVE_ORG), tr(S_SOURCE_ROMM), tr(S_CANCEL)}, false, {},
+        style_dialog);
+    if (r == 0) {
+        this->GotoPicker(Pending::AddRepo);
+    } else if (r == 1) {
+        this->RommPlatformsStart();
+    }
+}
+
+// Worker: GET /api/platforms into g_romm_platform_list, same shape as
+// RommTestThread.
+void MainApplication::RommPlatformsThread(void *arg) {
+    auto self = static_cast<MainApplication *>(arg);
+    bool ok = romm_fetch_platforms(&g_romm_creds, &g_romm_platform_list,
+                                   &self->romm_platforms_http_code,
+                                   self->romm_platforms_err,
+                                   sizeof(self->romm_platforms_err));
+    self->romm_platforms_ok = ok;
+    self->romm_platforms.done = true;
+}
+
+void MainApplication::RommPlatformsStart() {
+    romm_free_platforms(&g_romm_platform_list);
+    this->romm_platforms_ok = false;
+    if (!this->romm_platforms.Start(&MainApplication::RommPlatformsThread,
+                                    this)) {
+        this->ToastErr(tr(S_SAVE_FAILED));
+        return;
+    }
+    this->layout->ClearMenu();
+    this->layout->ShowSpinner(tr(S_LOADING));
+}
+
+void MainApplication::RommPlatformsTick() {
+    if (!this->romm_platforms.done) {
+        return;
+    }
+    this->layout->HideSpinner();
+    this->romm_platforms.Join();
+    if (!this->romm_platforms_ok) {
+        char body[256];
+        snprintf(body, sizeof(body), tr(S_ROMM_TEST_FAIL),
+                this->romm_platforms_err);
+        this->CreateShowDialog(tr(S_ROMM), body, {tr(S_OK)}, true, {},
+                               style_dialog);
+        this->GotoHome();
+        return;
+    }
+    this->GotoRommPlatformPicker();
+}
+
+// Browse (Y) -> RomM: pick a platform, live from /api/platforms -- see
+// GotoPicker for the archive.org equivalent this mirrors (sorted A-Z rows,
+// index resolved back through a display-order vector).
+void MainApplication::GotoRommPlatformPicker() {
+    this->screen = Screen::RommPlatformPicker;
+    this->layout->SetTitle(tr(S_TITLE_ROMM_PLATFORMS));
+    this->layout->SetSubtitle(tr(S_SUB_ROMM_PLATFORMS));
+    this->layout->ClearMenu();
+
+    g_romm_platform_order.clear();
+    for (int i = 0; i < g_romm_platform_list.count; i++) {
+        g_romm_platform_order.push_back(i);
+    }
+    std::sort(g_romm_platform_order.begin(), g_romm_platform_order.end(),
+             [](int a, int b) {
+                 const RommPlatform &pa = g_romm_platform_list.platforms[a];
+                 const RommPlatform &pb = g_romm_platform_list.platforms[b];
+                 const char *na = pa.name[0] ? pa.name : pa.slug;
+                 const char *nb = pb.name[0] ? pb.name : pb.slug;
+                 return strcasecmp(na, nb) < 0;
+             });
+
+    for (int idx : g_romm_platform_order) {
+        const RommPlatform &p = g_romm_platform_list.platforms[idx];
+        char cnt[32];
+        snprintf(cnt, sizeof(cnt), tr(S_N_ROMS), p.rom_count);
+        this->layout->AddRow2(p.name[0] ? p.name : p.slug, cnt,
+                              g_theme->row_text, count_color());
+    }
+    if (g_romm_platform_order.empty()) {
+        this->layout->AddRow(tr(S_EMPTY));
+    }
+}
+
+// Worker: GET /api/roms?platform_id=<romm_roms_platform_id> into
+// g_romm_roms_list, same shape as RommPlatformsThread.
+void MainApplication::RommRomsThread(void *arg) {
+    auto self = static_cast<MainApplication *>(arg);
+    bool ok = romm_fetch_roms(&g_romm_creds, self->romm_roms_platform_id,
+                              &g_romm_roms_list, &self->romm_roms_http_code,
+                              self->romm_roms_err, sizeof(self->romm_roms_err));
+    self->romm_roms_ok = ok;
+    self->romm_roms.done = true;
+}
+
+void MainApplication::RommRomsStart(int platform_id, const std::string &target,
+                                    const std::string &display_name) {
+    this->romm_roms_platform_id = platform_id;
+    this->romm_roms_target = target;
+    this->romm_roms_display_name = display_name;
+    this->romm_roms_ok = false;
+    if (!this->romm_roms.Start(&MainApplication::RommRomsThread, this)) {
+        this->ToastErr(tr(S_SAVE_FAILED));
+        return;
+    }
+    this->layout->ClearMenu();
+    this->layout->ShowSpinner(tr(S_LOADING_META));
+}
+
+// Convert a fetched RomM rom list into an ArchiveItem/ArchiveFile array (each
+// file's url_override pre-built via romm_content_url) so the existing Files
+// screen -- built entirely around ArchiveItem/ArchiveFile -- can list, mark,
+// and enqueue RomM roms without knowing they didn't come from archive.org.
+static void romm_roms_to_archive_item(const RommRomList *roms,
+                                      const RommCredentials *creds,
+                                      ArchiveItem *out) {
+    memset(out, 0, sizeof(*out));
+    out->files = (ArchiveFile *)calloc(roms->count > 0 ? roms->count : 1,
+                                       sizeof(ArchiveFile));
+    int added = 0;
+    if (out->files) {
+        for (int i = 0; i < roms->count; i++) {
+            const RommRom &r = roms->roms[i];
+            if (!r.fs_name[0]) {
+                continue;
+            }
+            ArchiveFile *f = &out->files[added];
+            snprintf(f->name, sizeof(f->name), "%s", r.fs_name);
+            f->size = r.size;
+            snprintf(f->md5, sizeof(f->md5), "%s", r.md5);
+            romm_content_url(creds, &r, f->url_override,
+                             sizeof(f->url_override));
+            added++;
+        }
+    }
+    out->file_count = added;
+}
+
+void MainApplication::RommRomsTick() {
+    if (!this->romm_roms.done) {
+        return;
+    }
+    this->layout->HideSpinner();
+    this->romm_roms.Join();
+    if (!this->romm_roms_ok) {
+        char body[256];
+        snprintf(body, sizeof(body), tr(S_ROMM_TEST_FAIL), this->romm_roms_err);
+        this->CreateShowDialog(tr(S_ROMM), body, {tr(S_OK)}, true, {},
+                               style_dialog);
+        this->GotoRommPlatformPicker();
+        return;
+    }
+    if (g_have_item) {
+        ia_free(&g_item);
+        g_have_item = false;
+    }
+    romm_roms_to_archive_item(&g_romm_roms_list, &g_romm_creds, &g_item);
+    romm_free_roms(&g_romm_roms_list);
+    g_have_item = true;
+    g_files_is_romm = true;
+    g_files_manual = true; // no "repo" to cycle through, same as a pasted URL
+    snprintf(g_files_id, sizeof(g_files_id), "romm:%d",
+            this->romm_roms_platform_id);
+    g_files_base[0] = '\0'; // unused: every file carries its own url_override
+    snprintf(g_files_target, sizeof(g_files_target), "%s",
+            this->romm_roms_target.c_str());
+    g_filter.clear();
+    g_sel.clear();
+    rebuild_files(this->layout.get(), g_files_target);
+    this->layout->SetTitle(this->romm_roms_display_name);
+    this->layout->SetSubtitle(FILES_SUBTITLE);
+    this->screen = Screen::Files;
+}
+
 // Display name used for Installed sorting: root console folders sort by their
 // full name (matching what's shown), everything else by its raw name.
 static const char *inst_disp_name(const DirEnt &d, bool is_root) {
@@ -5433,6 +5658,17 @@ void MainApplication::HandleInput(u64 down, u64 held,
         return;
     }
 
+    // Browse (Y) -> RomM is fetching the platform list, or (after one's
+    // picked) that platform's rom list -- same shape as romm_test above.
+    if (this->romm_platforms.running) {
+        this->RommPlatformsTick();
+        return;
+    }
+    if (this->romm_roms.running) {
+        this->RommRomsTick();
+        return;
+    }
+
     // A repo's metadata is loading on a background thread: animate the indicator
     // and swallow input until it's ready. B cancels — the fetch can't be aborted
     // mid-request, so it finishes in the background and its result is discarded.
@@ -6125,7 +6361,7 @@ void MainApplication::HandleInput(u64 down, u64 held,
                     return;
                 }
             } else if (down & HidNpadButton_Y) {
-                this->GotoPicker(Pending::AddRepo);
+                this->OfferAddSource();
             }
         } else {
             int ci, ri;
@@ -6136,7 +6372,7 @@ void MainApplication::HandleInput(u64 down, u64 held,
                        flat_ref(this->layout->Sel(), &ci, &ri)) {
                 this->GotoRepoEdit(ci, ri);
             } else if (down & HidNpadButton_Y) {
-                this->GotoPicker(Pending::AddRepo);
+                this->OfferAddSource();
             } else if (down & HidNpadButton_Minus) {
                 // Global search, same as the grouped view. Repo delete stays
                 // available in the app utility (X → delete).
@@ -6246,12 +6482,10 @@ void MainApplication::HandleInput(u64 down, u64 held,
                 if (!this->SpaceOkToQueue(f->size)) return;
                 char url[1024];
                 ia_file_url(&g_item, f, url, sizeof(url));
-                char auth[320];
-                creds_auth_header(&g_creds, auth, sizeof(auth));
-                bool ok = queue_add(url, f->name, g_files_target, auth,
-                                    f->size, is_archive_name(f->name),
-                                    f->md5,
-                                    install_folder_for(g_files_target));
+                bool ok = queue_add_current_source(
+                    url, f->name, g_files_target, f->size,
+                    is_archive_name(f->name), f->md5,
+                    install_folder_for(g_files_target));
                 if (ok) {
                     this->Toast(std::string(tr(S_QUEUED)) + ": " + f->name);
                 } else {
@@ -7875,6 +8109,28 @@ void MainApplication::HandleInput(u64 down, u64 held,
                 s32 keep = this->layout->Sel();
                 this->GotoRommCreds();
                 this->layout->SetSel(keep);
+            }
+        }
+        break;
+    }
+
+    case Screen::RommPlatformPicker: {
+        if (down & HidNpadButton_B) {
+            this->GotoHome();
+        } else if (down & HidNpadButton_A) {
+            s32 i = this->layout->Sel();
+            if (i >= 0 && i < (s32)g_romm_platform_order.size()) {
+                const RommPlatform &p =
+                    g_romm_platform_list.platforms[g_romm_platform_order[i]];
+                const char *target = romm_map_platform_console(&p);
+                if (!target) {
+                    this->CreateShowDialog(tr(S_ROMM),
+                                           tr(S_ROMM_PLATFORM_UNMAPPED),
+                                           {tr(S_OK)}, true, {}, style_dialog);
+                } else {
+                    this->RommRomsStart(p.id, target,
+                                        p.name[0] ? p.name : p.slug);
+                }
             }
         }
         break;

@@ -22,8 +22,9 @@ typedef struct {
      * so a non-archive.org provider whose files don't share one item-level
      * base (e.g. RomM, where each rom's URL carries its own numeric id) can
      * still populate an ArchiveItem/ArchiveFile list and reuse the Files
-     * screen built around them. */
-    char url_override[768];
+     * screen built around them. Sized for a server URL (~256) plus a
+     * percent-encoded filename (up to name's 512 chars, 3x worst case). */
+    char url_override[2048];
 } ArchiveFile;
 
 typedef struct {

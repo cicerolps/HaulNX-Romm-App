@@ -226,6 +226,16 @@ enum {
     S_ROMM_CLEAR_CREDS,
     S_ROMM_CLEAR_CREDS_CONFIRM,
 
+    /* ---- RomM: Browse (Y) source picker + platform picker ---- */
+    S_ADD_SOURCE_TITLE,
+    S_ADD_SOURCE_BODY,
+    S_SOURCE_ARCHIVE_ORG,
+    S_SOURCE_ROMM,
+    S_TITLE_ROMM_PLATFORMS,
+    S_SUB_ROMM_PLATFORMS,
+    S_N_ROMS,
+    S_ROMM_PLATFORM_UNMAPPED,
+
     /* ---- update ---- */
     S_TITLE_UPDATE,
     S_UPDATE_FETCH_FAIL,
