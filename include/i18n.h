@@ -207,6 +207,25 @@ enum {
     S_ACCESS_KEY,
     S_SECRET_KEY,
 
+    /* ---- RomM (second download source, alongside archive.org) ---- */
+    S_ROMM,
+    S_ROMM_STATUS_NOT_CONFIGURED,
+    S_ROMM_STATUS_CONNECTED,
+    S_ROMM_STATUS_FAILED,
+    S_TITLE_ROMM_CREDS,
+    S_SUB_ROMM_CREDS,
+    S_ROMM_SERVER_URL,
+    S_ROMM_USERNAME,
+    S_ROMM_PASSWORD,
+    S_ROMM_API_TOKEN,
+    S_ROMM_IGNORE_CERT,
+    S_ROMM_TEST_CONNECTION,
+    S_ROMM_TEST_RUNNING,
+    S_ROMM_TEST_OK_TOKEN,
+    S_ROMM_TEST_FAIL,
+    S_ROMM_CLEAR_CREDS,
+    S_ROMM_CLEAR_CREDS_CONFIRM,
+
     /* ---- update ---- */
     S_TITLE_UPDATE,
     S_UPDATE_FETCH_FAIL,

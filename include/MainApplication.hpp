@@ -582,6 +582,7 @@ class MainApplication : public pu::ui::Application {
         Log,
         Manage,   // show/hide consoles on the Browse page
         Creds,    // archive.org credentials editor
+        RommCreds, // RomM credentials editor (second download source)
         DlPrefs,  // Downloads settings (concurrency/rate/skip/keep-awake)
         Appearance, // Appearance settings (theme/cards/group/language)
         ExtFilter, // Browse file-view extension filter editor
@@ -734,6 +735,15 @@ class MainApplication : public pu::ui::Application {
     // to draw the meters and sets sp_prog.cancel to abort. See net.h SpeedProg.
     SpeedProg sp_prog{};
 
+    // Background RomM "Test connection" (Settings -> Account -> RomM): a single
+    // GET /api/platforms off the UI thread, same shape as the network self-test
+    // (diag) but its own task -- a RomM test must not collide with a Diagnostics
+    // self-test/speed test in flight.
+    BgTask romm_test;
+    std::atomic<bool> romm_test_ok{false};
+    long romm_test_http_code = 0;   // 0 = transport-level failure, not an HTTP response
+    char romm_test_err[160] = "";   // short, plain-English reason on failure
+
     // Background bulk metadata refresh (Manage data -> Refresh all metadata):
     // force-fetches every enabled repo's file list, with live (n/total)
     // progress and B to cancel between repos.
@@ -861,6 +871,10 @@ class MainApplication : public pu::ui::Application {
     void GotoLog();
     void GotoManage();
     void GotoCreds();
+    void GotoRommCreds();
+    void RommTestStart();   // kick off the background "Test connection" GET
+    void RommTestTick();    // poll it; show the result when done
+    static void RommTestThread(void *arg);
     void GotoDlPrefs();
     void GotoRomPicker(const std::string &path);
     void GotoAppearance();

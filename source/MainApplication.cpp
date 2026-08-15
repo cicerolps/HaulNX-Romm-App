@@ -15,6 +15,7 @@ extern "C" {
 #include "config.h"
 #include "i18n.h"
 #include "iarchive.h"
+#include "romm_client.h"
 #include "net.h"
 #include "queue.h"
 #include "extract.h"
@@ -32,6 +33,12 @@ extern "C" {
 // ---- backend state --------------------------------------------------------
 static SourcesConfig g_cfg;
 static Credentials g_creds;
+static RommCredentials g_romm_creds;
+// Session-only "last test" outcome for the Account row's status text (see
+// GotoAccount): romm_status_failed only shows after a test has actually been
+// run and failed, not merely because the connection has never been tested.
+static bool g_romm_tested = false;
+static bool g_romm_last_test_ok = false;
 static Prefs g_prefs;
 static TicoState g_tico;
 static ArchiveItem g_item;
@@ -2478,6 +2485,11 @@ static pu::ui::Color value_color() {
 static pu::ui::Color chevron_color() {
     return pu::ui::Color(125, 132, 150, 255);
 }
+// Failure-state red, matching Q_FAILED's queue-row color (qstatus_color).
+static pu::ui::Color error_color() {
+    return is_light_theme() ? pu::ui::Color(185, 35, 35, 255)
+                            : pu::ui::Color(240, 110, 110, 255);
+}
 static const char *CHEVRON = "›"; // › — marks a row that opens a screen
 
 void MainApplication::GotoSettings() {
@@ -2907,9 +2919,33 @@ void MainApplication::GotoAccount() {
     bool b = g_creds.access_key[0] != '\0';
     this->layout->AddRow2(settings_label(tr(S_ARCHIVE_CREDS)),
                           b ? tr(S_SET) : tr(S_UNSET), lbl, onoff_color(b)); // 0
+    // RomM: a second, independent source. Status mirrors its 3-state design
+    // (not configured / connected / connection failed) rather than the plain
+    // Set/Unset archive.org uses above — "connected" is shown optimistically
+    // once configured, until an actual Test connection run says otherwise.
+    bool romm_configured = romm_creds_configured(&g_romm_creds);
+    std::string romm_status;
+    pu::ui::Color romm_color;
+    if (!romm_configured) {
+        romm_status = tr(S_ROMM_STATUS_NOT_CONFIGURED);
+        romm_color = onoff_color(false);
+    } else if (g_romm_tested && !g_romm_last_test_ok) {
+        romm_status = tr(S_ROMM_STATUS_FAILED);
+        romm_color = error_color();
+    } else if (g_romm_creds.username[0]) {
+        char s[192];
+        snprintf(s, sizeof(s), tr(S_ROMM_STATUS_CONNECTED), g_romm_creds.username);
+        romm_status = s;
+        romm_color = onoff_color(true);
+    } else {
+        romm_status = tr(S_ROMM_TEST_OK_TOKEN);
+        romm_color = onoff_color(true);
+    }
+    this->layout->AddRow2(settings_label(tr(S_ROMM)), romm_status.c_str(), lbl,
+                          romm_color); // 1
     b = g_prefs.net_check;
     this->layout->AddRow2(settings_label(tr(S_NET_CHECK_STARTUP)),
-                          b ? tr(S_ON) : tr(S_OFF), lbl, onoff_color(b)); // 1
+                          b ? tr(S_ON) : tr(S_OFF), lbl, onoff_color(b)); // 2
 }
 
 // Updates: check now (GitHub release or a pushed .nro over Wi-Fi) and whether
@@ -4547,6 +4583,94 @@ void MainApplication::GotoCreds() {
     this->layout->AddRow(tr(S_CLEAR_CREDS));
 }
 
+// RomM: settings/romm_client.h's server URL, username/password, API token and
+// ignore-cert-verify toggle, plus test/remove actions. Same single-column
+// "Label: value" row style as GotoCreds (its archive.org sibling) — see
+// OnInput's Screen::RommCreds case for what each row does when pressed.
+void MainApplication::GotoRommCreds() {
+    this->screen = Screen::RommCreds;
+    this->layout->SetTitle(tr(S_TITLE_ROMM_CREDS));
+    this->layout->SetSubtitle(tr(S_SUB_ROMM_CREDS));
+    this->layout->ClearMenu();
+    char r[300];
+    snprintf(r, sizeof(r), "%s: %.100s", tr(S_ROMM_SERVER_URL),
+             g_romm_creds.server_url[0] ? g_romm_creds.server_url : tr(S_UNSET)); // 0
+    this->layout->AddRow(r);
+    snprintf(r, sizeof(r), "%s: %.60s", tr(S_ROMM_USERNAME),
+             g_romm_creds.username[0] ? g_romm_creds.username : tr(S_UNSET)); // 1
+    this->layout->AddRow(r);
+    snprintf(r, sizeof(r), "%s: %s", tr(S_ROMM_PASSWORD),
+             g_romm_creds.password[0] ? tr(S_SET) : tr(S_UNSET)); // 2
+    this->layout->AddRow(r);
+    snprintf(r, sizeof(r), "%s: %s", tr(S_ROMM_API_TOKEN),
+             g_romm_creds.api_token[0] ? tr(S_SET) : tr(S_UNSET)); // 3
+    this->layout->AddRow(r);
+    snprintf(r, sizeof(r), "%s: %s", tr(S_ROMM_IGNORE_CERT),
+             g_romm_creds.ignore_cert_verify ? tr(S_ON) : tr(S_OFF)); // 4
+    this->layout->AddRow(r);
+    this->layout->AddRow(tr(S_ROMM_TEST_CONNECTION)); // 5
+    this->layout->AddRow(tr(S_ROMM_CLEAR_CREDS));      // 6
+}
+
+// Worker for RomM "Test connection": a single GET /api/platforms with the
+// currently-saved credentials. Blocks, so it lives off the UI thread, same
+// shape as DiagThread (the archive.org/LAN self-test).
+void MainApplication::RommTestThread(void *arg) {
+    auto self = static_cast<MainApplication *>(arg);
+    bool ok = romm_test_connection(&g_romm_creds, &self->romm_test_http_code,
+                                   self->romm_test_err,
+                                   sizeof(self->romm_test_err));
+    self->romm_test_ok = ok;
+    self->romm_test.done = true;
+}
+
+// RomM credentials -> Test connection: kick the worker and show a spinner.
+// The screen stays put; RommTestTick reaps the result and shows it in a
+// dialog, same pattern as NetSelfTest/DiagTick.
+void MainApplication::RommTestStart() {
+    this->romm_test_ok = false;
+    this->romm_test_http_code = 0;
+    this->romm_test_err[0] = '\0';
+    if (!this->romm_test.Start(&MainApplication::RommTestThread, this)) {
+        this->ToastErr(tr(S_SAVE_FAILED));
+        return;
+    }
+    this->layout->ClearMenu();
+    this->layout->ShowSpinner(tr(S_ROMM_TEST_RUNNING));
+}
+
+// Poll the "Test connection" worker; called each frame while it runs (see the
+// romm_test.running check in OnInput's top dispatch chain).
+void MainApplication::RommTestTick() {
+    if (!this->romm_test.done) {
+        return;
+    }
+    this->romm_test.Join();
+    g_romm_tested = true;
+    g_romm_last_test_ok = this->romm_test_ok;
+    if (this->romm_test_ok) {
+        std::string body;
+        if (g_romm_creds.username[0]) {
+            char s[192];
+            snprintf(s, sizeof(s), tr(S_ROMM_STATUS_CONNECTED),
+                    g_romm_creds.username);
+            body = s;
+        } else {
+            body = tr(S_ROMM_TEST_OK_TOKEN);
+        }
+        this->CreateShowDialog(tr(S_ROMM_TEST_CONNECTION), body, {tr(S_OK)},
+                               true, {}, style_dialog);
+    } else {
+        char body[256];
+        snprintf(body, sizeof(body), tr(S_ROMM_TEST_FAIL), this->romm_test_err);
+        this->CreateShowDialog(tr(S_ROMM_TEST_CONNECTION), body, {tr(S_OK)},
+                               true, {}, style_dialog);
+    }
+    s32 keep = this->layout->Sel();
+    this->GotoRommCreds();
+    this->layout->SetSel(keep);
+}
+
 // Display name used for Installed sorting: root console folders sort by their
 // full name (matching what's shown), everything else by its raw name.
 static const char *inst_disp_name(const DirEnt &d, bool is_root) {
@@ -5299,6 +5423,13 @@ void MainApplication::HandleInput(u64 down, u64 held,
             this->sp_prog.cancel = 1; // curl aborts; DiagTick reaps when it lands
         }
         this->DiagTick();
+        return;
+    }
+
+    // A RomM "Test connection" is running: same quick-single-request shape as
+    // the network self-test above, just its own task and screen.
+    if (this->romm_test.running) {
+        this->RommTestTick();
         return;
     }
 
@@ -6705,8 +6836,9 @@ void MainApplication::HandleInput(u64 down, u64 held,
             this->GotoSettings();
         } else if (down & HidNpadButton_A) {
             switch (this->layout->Sel()) {
-            case 0: this->GotoCreds(); return; // archive.org credentials
-            case 1: // Warn if offline at startup
+            case 0: this->GotoCreds(); return;     // archive.org credentials
+            case 1: this->GotoRommCreds(); return; // RomM credentials
+            case 2: // Warn if offline at startup
                 g_prefs.net_check = !g_prefs.net_check;
                 prefs_save(&g_prefs);
                 break;
@@ -6718,7 +6850,7 @@ void MainApplication::HandleInput(u64 down, u64 held,
                 this->layout->SetSel(sel);
             }
         } else if (down & (HidNpadButton_Left | HidNpadButton_Right)) {
-            if (this->layout->Sel() == 1) {
+            if (this->layout->Sel() == 2) {
                 g_prefs.net_check = !g_prefs.net_check;
                 prefs_save(&g_prefs);
                 s32 sel = this->layout->Sel();
@@ -7650,6 +7782,104 @@ void MainApplication::HandleInput(u64 down, u64 held,
         break;
     }
 
+    case Screen::RommCreds: {
+        if (down & HidNpadButton_B) {
+            this->GotoAccount();
+        } else if (down & HidNpadButton_A) {
+            s32 i = this->layout->Sel();
+            char v[1024] = {0};
+            if (i == 0) {
+                if (prompt(tr(S_ROMM_SERVER_URL), g_romm_creds.server_url, v,
+                          sizeof(v))) {
+                    snprintf(g_romm_creds.server_url,
+                            sizeof(g_romm_creds.server_url), "%s", v);
+                    if (romm_creds_save(&g_romm_creds)) {
+                        romm_creds_load(&g_romm_creds); // pick up the
+                                                        // trailing-slash trim
+                        g_romm_tested = false;
+                        this->Toast(tr(S_SAVED));
+                    } else {
+                        this->ToastErr(tr(S_SAVE_FAILED));
+                    }
+                }
+            } else if (i == 1) {
+                if (prompt(tr(S_ROMM_USERNAME), g_romm_creds.username, v,
+                          sizeof(v))) {
+                    snprintf(g_romm_creds.username,
+                            sizeof(g_romm_creds.username), "%s", v);
+                    if (romm_creds_save(&g_romm_creds)) {
+                        g_romm_tested = false;
+                        this->Toast(tr(S_SAVED));
+                    } else {
+                        this->ToastErr(tr(S_SAVE_FAILED));
+                    }
+                }
+            } else if (i == 2) {
+                if (prompt(tr(S_ROMM_PASSWORD), g_romm_creds.password, v,
+                          sizeof(v))) {
+                    snprintf(g_romm_creds.password,
+                            sizeof(g_romm_creds.password), "%s", v);
+                    if (romm_creds_save(&g_romm_creds)) {
+                        g_romm_tested = false;
+                        this->Toast(tr(S_SAVED));
+                    } else {
+                        this->ToastErr(tr(S_SAVE_FAILED));
+                    }
+                }
+            } else if (i == 3) {
+                if (prompt(tr(S_ROMM_API_TOKEN), g_romm_creds.api_token, v,
+                          sizeof(v))) {
+                    snprintf(g_romm_creds.api_token,
+                            sizeof(g_romm_creds.api_token), "%s", v);
+                    if (romm_creds_save(&g_romm_creds)) {
+                        g_romm_tested = false;
+                        this->Toast(tr(S_SAVED));
+                    } else {
+                        this->ToastErr(tr(S_SAVE_FAILED));
+                    }
+                }
+            } else if (i == 4) {
+                g_romm_creds.ignore_cert_verify = !g_romm_creds.ignore_cert_verify;
+                if (romm_creds_save(&g_romm_creds)) {
+                    g_romm_tested = false;
+                } else {
+                    this->ToastErr(tr(S_SAVE_FAILED));
+                }
+            } else if (i == 5) {
+                if (romm_creds_configured(&g_romm_creds)) {
+                    this->RommTestStart();
+                } else {
+                    this->ToastErr(tr(S_ROMM_STATUS_NOT_CONFIGURED));
+                }
+                return;
+            } else if (i == 6) {
+                if (this->ConfirmDanger(tr(S_ROMM_CLEAR_CREDS),
+                                        tr(S_ROMM_CLEAR_CREDS_CONFIRM))) {
+                    romm_creds_remove(); // deletes romm_credentials.json outright
+                    memset(&g_romm_creds, 0, sizeof(g_romm_creds));
+                    g_romm_tested = false;
+                    this->Toast(tr(S_CLEARED));
+                }
+            }
+            s32 keep = this->layout->Sel();
+            this->GotoRommCreds();
+            this->layout->SetSel(keep);
+        } else if (down & (HidNpadButton_Left | HidNpadButton_Right)) {
+            if (this->layout->Sel() == 4) {
+                g_romm_creds.ignore_cert_verify = !g_romm_creds.ignore_cert_verify;
+                if (romm_creds_save(&g_romm_creds)) {
+                    g_romm_tested = false;
+                } else {
+                    this->ToastErr(tr(S_SAVE_FAILED));
+                }
+                s32 keep = this->layout->Sel();
+                this->GotoRommCreds();
+                this->layout->SetSel(keep);
+            }
+        }
+        break;
+    }
+
     case Screen::Search: {
         if (down & HidNpadButton_B) {
             // Return to wherever the search was launched from.
@@ -7704,6 +7934,7 @@ void MainApplication::OnLoad() {
     config_load(&g_cfg);
     config_sort(&g_cfg);
     creds_load(&g_creds);
+    romm_creds_load(&g_romm_creds);
     prefs_load(&g_prefs);
     /* A user-set ROM folder overrides the default ROM root. */
     tico_set_roms_override(&g_tico, g_prefs.roms_override);
