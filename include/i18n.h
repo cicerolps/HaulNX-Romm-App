@@ -238,6 +238,8 @@ enum {
     S_LABEL_ROMM_PLATFORM_ID,
     S_LABEL_ROMM_SOURCE,
     S_ROMM_REPO_FIELD_LOCKED,
+    S_SWITCH_TO_GRID,
+    S_SWITCH_TO_LIST,
 
     /* ---- update ---- */
     S_TITLE_UPDATE,

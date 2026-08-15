@@ -136,6 +136,8 @@
   "label_romm_platform_id": "ID da plataforma RomM: %s",
   "label_romm_source": "Fonte: RomM (%s)",
   "romm_repo_field_locked": "Não editável em um repositório do RomM",
+  "switch_to_grid": "Mudar para visualização em grade",
+  "switch_to_list": "Mudar para visualização em lista",
   "title_update": "Atualização",
   "update_fetch_fail": "Não foi possível obter informações da versão.",
   "update_up_to_date": "Você está atualizado (v%s).",

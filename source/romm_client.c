@@ -288,6 +288,8 @@ static bool parse_roms(const char *body, size_t len, RommRomList *out) {
             r->size = json_u64_size(body, tok,
                                     json_obj_get(body, tok, child, "fs_size_bytes"));
             copy_str_field(body, tok, child, "md5_hash", r->md5, sizeof(r->md5));
+            copy_str_field(body, tok, child, "path_cover_small",
+                          r->path_cover_small, sizeof(r->path_cover_small));
             if (r->fs_name[0]) {
                 added++;
             }
@@ -374,6 +376,18 @@ void romm_content_url(const RommCredentials *c, const RommRom *rom, char *out,
     url_encode_component(rom->fs_name, enc, sizeof(enc));
     snprintf(out, out_sz, "%s/api/roms/%d/content/%s", c->server_url, rom->id,
             enc);
+}
+
+void romm_cover_url(const RommCredentials *c, const RommRom *rom, char *out,
+                    size_t out_sz) {
+    if (!rom->path_cover_small[0]) {
+        out[0] = '\0';
+        return;
+    }
+    /* path_cover_small already starts with '/' and is itself a static-asset
+     * path (not under /api) -- server_url + path_cover_small is the whole
+     * URL, same concatenation romm_content_url does for /api paths. */
+    snprintf(out, out_sz, "%s%s", c->server_url, rom->path_cover_small);
 }
 
 /* ---- platform -> HaulNX console mapping --------------------------------- */

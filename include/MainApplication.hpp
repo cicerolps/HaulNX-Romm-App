@@ -540,6 +540,10 @@ class MainLayout : public pu::ui::Layout {
     void AddCard(const std::string &title, const std::string &subtitle,
                  pu::sdl2::Texture icon, bool pinned = false,
                  bool dim = false);
+    // Swap one card's icon in place (e.g. a RomM cover-art thumbnail landing
+    // after the card was first built with a fallback icon). No-op outside
+    // card mode.
+    void SetCardIcon(s32 i, pu::sdl2::Texture icon);
     // Queue card view: per-frame diff updates instead of Clear + AddCard.
     // Single-card mode shows one enlarged centred card (self-update).
     void SetSingleCard(bool on);
@@ -777,6 +781,31 @@ class MainApplication : public pu::ui::Application {
      * repo (g_files_manual=false, B returns to Screen::Repos) or like the
      * ephemeral one-off browse (g_files_manual=true, B returns to Home). */
     bool romm_roms_from_repo = false;
+
+    // Background RomM cover-art cache warmer: after a listing loads, quietly
+    // downloads each file's cover thumbnail to CACHE_DIR/romm_covers/<platform>/
+    // (see RommCoversStart) so the grid view's cards can pick them up from
+    // disk as they land. Runs one file at a time on its own thread, reading
+    // only its job list (g_romm_cover_jobs) -- never g_item directly. Safe
+    // because RommCoversStart only clears/repopulates that job list (and
+    // g_romm_cover_paths/g_romm_cover_tex) AFTER synchronously cancelling and
+    // Join()ing any run already in flight, same idiom as GotoSearch
+    // superseding a running scan (and g_ra_ids/RaStart's "rebuild only when
+    // nothing is reading it" contract) -- so a later listing switch can never
+    // race a worker still reading the previous listing's job list. Reaped
+    // non-blockingly every frame by RommCoversPoll, same shape as BgChkPoll.
+    BgTask romm_covers;
+    std::atomic<bool> romm_covers_cancel{false};
+    static int RommCoverProgressCb(void *userdata, uint64_t now, uint64_t total);
+    static void RommCoversThread(void *arg);
+    void RommCoversStart(); // (re)start caching covers for the just-loaded g_item
+    void RommCoversPoll();  // non-blocking: reap a finished run
+    // Every frame while Screen::Files is showing a RomM listing in grid view:
+    // decode+show the cover for each newly-visible card whose file has landed
+    // on disk, and free+fall back to the console icon for cards that scrolled
+    // out of view (bounds resident cover textures to roughly one screen's
+    // worth). No-op otherwise.
+    void RommCoverGridTick();
 
     // Background bulk metadata refresh (Manage data -> Refresh all metadata):
     // force-fetches every enabled repo's file list, with live (n/total)

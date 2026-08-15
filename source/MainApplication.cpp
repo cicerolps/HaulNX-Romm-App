@@ -78,6 +78,25 @@ static bool g_files_manual = false;
 // listing (it has no "repo" to cycle through either, same as a pasted
 // archive.org URL), but that flag alone can't tell the two apart.
 static bool g_files_is_romm = false;
+// Grid (cover-art) vs list display for the current Files listing. Only ever
+// true for a RomM listing (list mode is the only display archive.org's has
+// -- see rebuild_files); defaulted true whenever a fresh RomM listing loads
+// (RommRomsTick) and togglable from the View menu (FilesViewMenu).
+static bool g_files_card_view = false;
+// Parallel to g_item.files (by index): the on-disk cache path RommCoversStart
+// picked for each file's cover ("" if the file has no cover_url), and the
+// decoded texture once RommCoverGridTick has loaded it (nullptr until then,
+// and while scrolled out of view -- see its doc comment). UI-thread-only:
+// the cover-fetch worker never reads or writes these, only g_romm_cover_jobs
+// below (and only ever the copy RommCoversStart handed it before it began).
+static std::vector<std::string> g_romm_cover_paths;
+static std::vector<pu::sdl2::Texture> g_romm_cover_tex;
+// The cover-fetch worker's job list, rebuilt by RommCoversStart -- see
+// MainApplication::romm_covers' doc comment for why this is safe without a
+// lock (only ever touched after a synchronous cancel+Join of whatever was
+// reading the previous contents).
+struct RommCoverJob { std::string url, path; };
+static std::vector<RommCoverJob> g_romm_cover_jobs;
 
 #define FILES_SUBTITLE tr(S_SUB_FILES)
 
@@ -802,6 +821,16 @@ static void rebuild_files(MainLayout *lay, const char *target,
         build_installed_index(target, g_inst_idx);
         load_dl_md5(); // md5 of what we installed, to spot repo-updated files
     }
+    // Grid (cover art) display is a RomM-only alternative to the list above --
+    // archive.org listings have no cover metadata and always render as rows.
+    // Multi-select (marks) stays list-only: CardGrid has no mark visual, so
+    // Y-toggle and the View menu's select-all/clear are hidden in grid mode
+    // (see HandleInput/FilesViewMenu) rather than mutating g_sel invisibly.
+    bool grid = g_files_is_romm && g_files_card_view;
+    if (grid) {
+        lay->SetCardsMode(true);
+    }
+    pu::sdl2::Texture fallback_icon = console_icon(target);
     int updates = 0;
     for (int k = 0; k < (int)g_files.size(); k++) {
         ArchiveFile *f = &g_item.files[g_files[k]];
@@ -823,17 +852,27 @@ static void rebuild_files(MainLayout *lay, const char *target,
         char name[540];
         snprintf(name, sizeof(name), "%s%s",
                  mark == 2 ? "↑ " : mark == 1 ? "* " : "", f->name);
-        lay->AddRow2(name, human_size(f->size),
-                     g_theme->row_text, size_color(f->size));
-        // Re-apply the selection: ClearMenu() wiped the widget's row marks, but
-        // g_sel is keyed to the file, so a row that reappears under a different
-        // filter or sort comes back still selected.
-        if (g_sel.count(g_files[k])) {
-            lay->SetMark(k, true);
+        if (grid) {
+            // Fallback icon until RommCoverGridTick swaps in the decoded
+            // cover (or forever, for a file with no cover_url).
+            lay->AddCard(name, human_size(f->size), fallback_icon);
+        } else {
+            lay->AddRow2(name, human_size(f->size),
+                         g_theme->row_text, size_color(f->size));
+            // Re-apply the selection: ClearMenu() wiped the widget's row marks,
+            // but g_sel is keyed to the file, so a row that reappears under a
+            // different filter or sort comes back still selected.
+            if (g_sel.count(g_files[k])) {
+                lay->SetMark(k, true);
+            }
         }
     }
     if (g_files.empty()) {
-        lay->AddRow(tr(S_NO_FILES_MATCH));
+        if (grid) {
+            lay->SetEmptyState(fallback_icon, tr(S_NO_FILES_MATCH));
+        } else {
+            lay->AddRow(tr(S_NO_FILES_MATCH));
+        }
     }
     g_files_updates = updates;
     files_info_line(lay);
@@ -1703,6 +1742,9 @@ void MainLayout::AddCard(const std::string &title, const std::string &subtitle,
                          pu::sdl2::Texture icon, bool pinned, bool dim) {
     this->grid->AddCard(title, subtitle, icon, pinned, dim);
 }
+void MainLayout::SetCardIcon(s32 i, pu::sdl2::Texture icon) {
+    this->grid->SetCardIcon(i, icon);
+}
 void MainLayout::SetSingleCard(bool on) { this->grid->SetSingle(on); }
 void MainLayout::SetQueueCount(s32 n) { this->grid->SetQueueCount(n); }
 void MainLayout::SetQueueCard(s32 i, const std::string &console,
@@ -1854,18 +1896,29 @@ bool MainApplication::SpaceOkToQueue(uint64_t add_size) {
 // one menu now covers everything that changes what the list shows or what is
 // picked out of it.
 void MainApplication::FilesViewMenu() {
-    enum { ACT_FILTER, ACT_SORT, ACT_ALL, ACT_NONE };
+    enum { ACT_FILTER, ACT_SORT, ACT_ALL, ACT_NONE, ACT_GRID_TOGGLE };
     std::vector<std::string> opts;
     std::vector<int> acts;
     opts.push_back(tr(S_FILTER)); acts.push_back(ACT_FILTER);
     opts.push_back(tr(S_SORT));   acts.push_back(ACT_SORT);
-    if (!g_files.empty()) {
-        char lb[96];
-        snprintf(lb, sizeof(lb), tr(S_SELECT_ALL_SHOWN), (int)g_files.size());
-        opts.push_back(lb); acts.push_back(ACT_ALL);
+    // Grid <-> list is RomM-only (cover art is the whole point; archive.org
+    // listings have no cover metadata) and mutually exclusive with
+    // multi-select, so select-all/clear are hidden while the grid is active
+    // -- see rebuild_files' grid branch and the Y-handler's InCards() guard.
+    if (g_files_is_romm) {
+        opts.push_back(tr(g_files_card_view ? S_SWITCH_TO_LIST
+                                            : S_SWITCH_TO_GRID));
+        acts.push_back(ACT_GRID_TOGGLE);
     }
-    if (!g_sel.empty()) {
-        opts.push_back(tr(S_CLEAR_SELECTION)); acts.push_back(ACT_NONE);
+    if (!this->layout->InCards()) {
+        if (!g_files.empty()) {
+            char lb[96];
+            snprintf(lb, sizeof(lb), tr(S_SELECT_ALL_SHOWN), (int)g_files.size());
+            opts.push_back(lb); acts.push_back(ACT_ALL);
+        }
+        if (!g_sel.empty()) {
+            opts.push_back(tr(S_CLEAR_SELECTION)); acts.push_back(ACT_NONE);
+        }
     }
     opts.push_back(tr(S_CANCEL));
 
@@ -1882,6 +1935,10 @@ void MainApplication::FilesViewMenu() {
         }
         break;
     }
+    case ACT_GRID_TOGGLE:
+        g_files_card_view = !g_files_card_view;
+        rebuild_files(this->layout.get(), g_files_target, false);
+        break;
     case ACT_SORT: {
         int s = this->CreateShowDialog(
             tr(g_sort_keys[g_sort_mode]), "",
@@ -4931,6 +4988,7 @@ static void romm_roms_to_archive_item(const RommRomList *roms,
             snprintf(f->md5, sizeof(f->md5), "%s", r.md5);
             romm_content_url(creds, &r, f->url_override,
                              sizeof(f->url_override));
+            romm_cover_url(creds, &r, f->cover_url, sizeof(f->cover_url));
             added++;
         }
     }
@@ -4977,12 +5035,141 @@ void MainApplication::RommRomsTick() {
             this->romm_roms_target.c_str());
     g_filter.clear();
     g_sel.clear();
+    g_files_card_view = true; // default a fresh RomM listing to the cover grid
     rebuild_files(this->layout.get(), g_files_target);
+    this->RommCoversStart(); // quietly cache covers for the grid in the background
     if (!this->romm_roms_from_repo) {
         this->layout->SetTitle(this->romm_roms_display_name);
     }
     this->layout->SetSubtitle(FILES_SUBTITLE);
     this->screen = Screen::Files;
+}
+
+// ---- RomM cover-art cache warmer (grid view thumbnails) --------------------
+
+int MainApplication::RommCoverProgressCb(void *userdata, uint64_t, uint64_t) {
+    auto self = static_cast<MainApplication *>(userdata);
+    return self->romm_covers_cancel ? 1 : 0; // non-zero aborts the transfer
+}
+
+// Runs entirely off g_romm_cover_jobs (rebuilt by RommCoversStart) -- never
+// touches g_item or any other g_romm_cover_* global. See the class doc
+// comment on romm_covers for why a listing switch on the UI thread can never
+// race this.
+void MainApplication::RommCoversThread(void *arg) {
+    auto self = static_cast<MainApplication *>(arg);
+    char host[256];
+    romm_server_authority(g_romm_creds.server_url, host, sizeof(host));
+    char auth[400];
+    romm_creds_queue_auth_header(&g_romm_creds, auth, sizeof(auth));
+    for (const auto &j : g_romm_cover_jobs) {
+        if (self->romm_covers_cancel) {
+            break;
+        }
+        if (fs_exists(j.path.c_str())) {
+            continue; // cached from a previous visit to this listing
+        }
+        long code = 0;
+        http_download_authed(j.url.c_str(), j.path.c_str(), host, auth,
+                             !g_romm_creds.ignore_cert_verify,
+                             &MainApplication::RommCoverProgressCb, self,
+                             nullptr, nullptr, 0, &code);
+    }
+    self->romm_covers.done = true;
+}
+
+void MainApplication::RommCoversStart() {
+    // Cancel + synchronously reap whatever the previous listing's cache-warm
+    // was doing before touching g_romm_cover_* -- same cancel+Join idiom
+    // GotoSearch uses when a new search supersedes one already running. Only
+    // past this point is it safe to clear/repopulate g_romm_cover_jobs: no
+    // thread is still reading the old contents.
+    this->romm_covers_cancel = true;
+    if (this->romm_covers.running) {
+        this->romm_covers.Join();
+    }
+    this->romm_covers_cancel = false;
+
+    for (auto t : g_romm_cover_tex) {
+        if (t) {
+            pu::ui::render::DeleteTexture(t);
+        }
+    }
+    g_romm_cover_tex.assign(g_item.file_count > 0 ? g_item.file_count : 0,
+                            nullptr);
+    g_romm_cover_paths.assign(g_item.file_count > 0 ? g_item.file_count : 0,
+                              "");
+    g_romm_cover_jobs.clear();
+
+    char dir[512];
+    snprintf(dir, sizeof(dir), "%s/romm_covers/%d", CACHE_DIR,
+            this->romm_roms_platform_id);
+    for (int i = 0; i < g_item.file_count; i++) {
+        if (!g_item.files[i].cover_url[0]) {
+            continue;
+        }
+        char path[600];
+        snprintf(path, sizeof(path), "%s/%d.img", dir, i);
+        g_romm_cover_paths[i] = path;
+        g_romm_cover_jobs.push_back({g_item.files[i].cover_url, path});
+    }
+    if (g_romm_cover_jobs.empty()) {
+        return;
+    }
+    fs_mkdir_p(dir);
+    this->romm_covers.Start(&MainApplication::RommCoversThread, this);
+}
+
+void MainApplication::RommCoversPoll() {
+    if (this->romm_covers.running && this->romm_covers.done) {
+        this->romm_covers.Join();
+    }
+}
+
+void MainApplication::RommCoverGridTick() {
+    if (this->screen != Screen::Files || !g_files_is_romm ||
+        !g_files_card_view) {
+        return;
+    }
+    for (int k = 0; k < (int)g_files.size(); k++) {
+        int fi = g_files[k];
+        if (fi < 0 || fi >= (int)g_romm_cover_paths.size()) {
+            continue;
+        }
+        if (!this->layout->QueueCardVisible(k)) {
+            // Scrolled out of view: drop the decoded texture (reloads
+            // instantly from the disk cache if scrolled back) to keep
+            // resident cover textures bounded to roughly one screen's worth.
+            // The card's icon is reset right along with it -- CardGrid only
+            // renders cards inside its own live visible window, but leaving
+            // the freed pointer in place would dangle the moment this exact
+            // row becomes visible again before a fresh cover has loaded.
+            if (g_romm_cover_tex[fi]) {
+                pu::ui::render::DeleteTexture(g_romm_cover_tex[fi]);
+                g_romm_cover_tex[fi] = nullptr;
+                this->layout->SetCardIcon(k, console_icon(g_files_target));
+            }
+            continue;
+        }
+        if (g_romm_cover_tex[fi]) {
+            // Already decoded -- re-apply every tick (cheap: SetCardIcon is a
+            // plain pointer swap, no cache rebuild) so a card that gets
+            // rebuilt from scratch by a filter/sort change picks its cover
+            // back up instead of getting stuck on the fallback icon
+            // rebuild_files just gave it.
+            this->layout->SetCardIcon(k, g_romm_cover_tex[fi]);
+            continue;
+        }
+        if (g_romm_cover_paths[fi].empty() ||
+            !fs_exists(g_romm_cover_paths[fi].c_str())) {
+            continue; // no cover, or not downloaded yet
+        }
+        auto tex = pu::ui::render::LoadImageFromFile(g_romm_cover_paths[fi]);
+        if (tex) {
+            g_romm_cover_tex[fi] = tex;
+            this->layout->SetCardIcon(k, tex);
+        }
+    }
 }
 
 // Display name used for Installed sorting: root console folders sort by their
@@ -5701,6 +5888,12 @@ void MainApplication::HandleInput(u64 down, u64 held,
     }
     // Reap the silent startup update check (if any) and light the Settings dot.
     this->BgChkPoll();
+    // Non-blocking, every frame, regardless of screen: reap a finished cover
+    // cache-warm and (only while Screen::Files is showing a RomM grid) load
+    // newly-visible cards' covers / free ones that scrolled away. Never
+    // consumes input or blocks like the tasks below.
+    this->RommCoversPoll();
+    this->RommCoverGridTick();
 
     // A self-update download owns the UI while it runs: drive its progress /
     // finish and swallow all other input until it completes.
@@ -6596,10 +6789,12 @@ void MainApplication::HandleInput(u64 down, u64 held,
                 this->GotoSearch(q, this->sel_ci, this->sel_ri);
                 return;
             }
-        } else if (down & HidNpadButton_Y) {
+        } else if ((down & HidNpadButton_Y) && !this->layout->InCards()) {
             // Toggle this row's selection. Only the widget mark and the info
             // line change — rebuilding the list on every press would re-add
-            // thousands of rows for one keystroke.
+            // thousands of rows for one keystroke. Grid view has no mark
+            // visual (CardGrid's cards aren't multi-selectable), so this is
+            // list-only -- see rebuild_files' grid branch.
             s32 i = this->layout->Sel();
             if (i >= 0 && i < (s32)g_files.size()) {
                 int fi = g_files[i];

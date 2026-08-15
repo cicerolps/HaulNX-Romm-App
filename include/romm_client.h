@@ -38,6 +38,14 @@ typedef struct {
     char name[256];    /* display name; "" if RomM has none (fall back to fs_name) */
     uint64_t size;      /* fs_size_bytes, 0 if unknown */
     char md5[33];       /* md5_hash hex, "" if unknown */
+    /* Root-relative path to the small cover thumbnail (RomM's own
+     * `path_cover_small`, e.g. "/assets/romm/resources/roms/1/1/cover/
+     * small.png?ts=..."), already query-stringed for cache-busting on
+     * re-scrape. "" if the rom has no cover. Served by RomM's own
+     * frontend/nginx as a static file (not under /api), so
+     * server_url+path_cover_small is the complete URL -- see
+     * romm_cover_url. */
+    char path_cover_small[600];
 } RommRom;
 
 typedef struct {
@@ -77,6 +85,11 @@ bool romm_test_connection(const RommCredentials *c, long *http_code, char *err,
  * (fs_name percent-encoded). */
 void romm_content_url(const RommCredentials *c, const RommRom *rom, char *out,
                       size_t out_sz);
+
+/* Build the small cover-art thumbnail URL for a rom (server_url +
+ * path_cover_small). out is set to "" if the rom has no cover. */
+void romm_cover_url(const RommCredentials *c, const RommRom *rom, char *out,
+                    size_t out_sz);
 
 /* The bare host[:port] authority of a RomM server_url (e.g. "192.168.1.10:8080"
  * from "http://192.168.1.10:8080") -- the auth_host queue_add_ex and

@@ -218,6 +218,8 @@
   "label_romm_platform_id": "RomM Platform ID: %s",
   "label_romm_source": "Source: RomM (%s)",
   "romm_repo_field_locked": "Not editable for a RomM repository",
+  "switch_to_grid": "Switch to grid view",
+  "switch_to_list": "Switch to list view",
 
   "title_update": "Update",
   "update_fetch_fail": "Could not fetch release info.",

@@ -25,6 +25,12 @@ typedef struct {
      * screen built around them. Sized for a server URL (~256) plus a
      * percent-encoded filename (up to name's 512 chars, 3x worst case). */
     char url_override[2048];
+    /* RomM cover-art thumbnail URL (romm_cover_url), or "" if this file has
+     * no cover / isn't from RomM. Never set by ia_fetch; only
+     * romm_roms_to_archive_item populates it, mirroring url_override. Kept
+     * here (rather than re-derived from the since-freed RommRomList) so it
+     * survives as long as the file list itself does. */
+    char cover_url[600];
 } ArchiveFile;
 
 typedef struct {
