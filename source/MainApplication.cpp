@@ -5035,9 +5035,14 @@ void MainApplication::RommRomsTick() {
             this->romm_roms_target.c_str());
     g_filter.clear();
     g_sel.clear();
-    g_files_card_view = true; // default a fresh RomM listing to the cover grid
+    // List view by default -- cover art in the grid isn't reliable yet. The
+    // grid toggle stays in the View menu for whenever that's revisited. The
+    // cache-warm below runs regardless of display mode, so covers keep
+    // landing on disk in the background while the list is browsed -- no
+    // reason to wait on fixing the grid to at least warm the cache.
+    g_files_card_view = false;
     rebuild_files(this->layout.get(), g_files_target);
-    this->RommCoversStart(); // quietly cache covers for the grid in the background
+    this->RommCoversStart(); // quietly cache covers in the background
     if (!this->romm_roms_from_repo) {
         this->layout->SetTitle(this->romm_roms_display_name);
     }
