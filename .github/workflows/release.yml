@@ -1,0 +1,48 @@
+name: Release
+
+# Publishes a GitHub Release whenever a "v*" tag is pushed (e.g. v1.1.2-romm.1):
+# builds the .nro on the same devkitA64 toolchain as build.yml, then attaches it
+# to a Release the in-app updater (UPDATE_REPO in config.h) can find -- see
+# update_fetch_latest, which scans this repo's releases for one with a .nro
+# asset and a tag_name it can parse as X.Y.Z.
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container: devkitpro/devkita64:latest
+    steps:
+      - name: Checkout (com submódulos)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Build
+        run: make
+
+      - name: Upload .nro
+        uses: actions/upload-artifact@v4
+        with:
+          name: nro
+          path: "*.nro"
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download .nro
+        uses: actions/download-artifact@v4
+        with:
+          name: nro
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: "*.nro"
+          generate_release_notes: true

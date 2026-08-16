@@ -13,7 +13,7 @@ extern "C" {
 
 /* GitHub repo (owner/name) the in-app updater pulls releases from.
  * >>> EDIT THIS to your repo before building a release you intend to ship. <<< */
-#define UPDATE_REPO   "digdat0/HaulNX"
+#define UPDATE_REPO   "cicerolps/HaulNX-Romm-App"
 
 /* Where the app lives if it can't determine its own path from argv[0]. */
 #define DEFAULT_SELF_PATH "sdmc:/switch/HaulNX/HaulNX.nro"
